@@ -10,6 +10,7 @@ Read in roughly this order.
 | [PR_FAQ.md](PR_FAQ.md) | Amazon-style "working backwards" press release + FAQ — the customer-framed *why*. |
 | [Product_Requirements.md](Product_Requirements.md) | PRD: personas, user stories, success metrics, scope & non-goals. |
 | [Scope_and_Production_Comparison.md](Scope_and_Production_Comparison.md) | Honest boundary: what this build is vs. a production Ola/Uber backend, component by component. |
+| [Extra_Additions.md](Extra_Additions.md) | Post-project idea backlog (e.g. ride-pooling / shared rides) to build after v1 is done. |
 
 ## 2. How (design)
 | Doc | Purpose |
