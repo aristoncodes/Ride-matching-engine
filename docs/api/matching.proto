@@ -1,0 +1,79 @@
+// gRPC contract between the Go service layer and the C++ matching engine.
+//
+// Design intent (see docs/adr/0002-grpc-over-cgo-for-go-cpp-bridge.md):
+//   - The C++ engine runs as a SEPARATE PROCESS behind this gRPC service, so a
+//     C++ crash returns an error to Go instead of taking the Go process down.
+//   - The engine is STATELESS per call: Go sends a full batch (riders +
+//     candidate drivers), the engine returns the optimal assignment. No shared
+//     mutable state across calls.
+//   - This .proto is the binding contract; it is defined BEFORE either side is
+//     implemented (Week 6) and versioned thereafter.
+
+syntax = "proto3";
+
+package matching.v1;
+
+option go_package = "github.com/aditya/ride-matching/gen/matching/v1;matchingv1";
+
+// ---- Messages ----------------------------------------------------------
+
+message LatLng {
+  double lat = 1;
+  double lng = 2;
+}
+
+message Rider {
+  string id = 1;        // "R-<uuid>"
+  LatLng pickup = 2;
+}
+
+message Driver {
+  string id = 1;        // "D-<uuid>"
+  LatLng location = 2;
+}
+
+// One batch of work for a single tenant's 3-second window.
+message MatchBatchRequest {
+  string tenant_id = 1;
+  string batch_id = 2;              // idempotency / tracing key
+  repeated Rider riders = 3;
+  repeated Driver candidate_drivers = 4;  // pre-filtered via Redis GEORADIUS
+  CostMetric cost_metric = 5;
+}
+
+enum CostMetric {
+  COST_METRIC_UNSPECIFIED = 0;
+  COST_METRIC_EUCLIDEAN = 1;        // straight-line (fast, approximate)
+  COST_METRIC_TRAVEL_TIME = 2;      // road-graph routing (accurate)
+}
+
+message Match {
+  string rider_id = 1;
+  string driver_id = 2;
+  double cost = 3;
+  int32 eta_seconds = 4;
+}
+
+message MatchBatchResponse {
+  string batch_id = 1;
+  repeated Match matches = 2;
+  repeated string unmatched_rider_ids = 3;   // when riders > drivers
+  int64 compute_micros = 4;                  // measured solve time (for SLO tracking)
+}
+
+// ---- Service -----------------------------------------------------------
+
+service MatchingEngine {
+  // Solve one batch to an optimal assignment. Callers MUST set a deadline;
+  // the engine is expected to respond well within the batch window.
+  rpc SolveBatch(MatchBatchRequest) returns (MatchBatchResponse);
+
+  // Lightweight health probe for Kubernetes readiness/liveness.
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message HealthRequest {}
+message HealthResponse {
+  bool healthy = 1;
+  string version = 2;
+}

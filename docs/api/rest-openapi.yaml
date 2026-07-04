@@ -1,0 +1,135 @@
+# Public REST API contract for the Ride-Matching Engine.
+# Defined before the Ride Request Service is coded (Week 11) so integrating
+# clients have a stable, versioned contract. Authentication is per-tenant via
+# an API key; every request is scoped to the caller's tenant.
+
+openapi: 3.0.3
+info:
+  title: Ride-Matching Engine API
+  version: "1.0.0"
+  description: >
+    B2B API for submitting rider requests and retrieving match results.
+    All endpoints require an API key that resolves to a single tenant; data is
+    strictly isolated per tenant (see docs/Threat_Model.md).
+
+servers:
+  - url: https://api.example.com/v1
+    description: Production (v1)
+
+security:
+  - ApiKeyAuth: []
+
+paths:
+  /ride-requests:
+    post:
+      summary: Submit a new ride request
+      operationId: createRideRequest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RideRequestInput"
+      responses:
+        "202":
+          description: Accepted and enqueued for the next matching window.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RideRequestAccepted"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /ride-requests/{id}:
+    get:
+      summary: Get the status/result of a ride request
+      operationId: getRideRequest
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, example: "RQ-9f2c..." }
+      responses:
+        "200":
+          description: Current status, including the match if completed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RideRequestStatus"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /health:
+    get:
+      summary: Liveness/readiness probe
+      operationId: health
+      security: []
+      responses:
+        "200": { description: OK }
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+
+  schemas:
+    LatLng:
+      type: object
+      required: [lat, lng]
+      properties:
+        lat: { type: number, format: double, example: 37.7749 }
+        lng: { type: number, format: double, example: -122.4194 }
+
+    RideRequestInput:
+      type: object
+      required: [rider_id, pickup]
+      properties:
+        rider_id: { type: string, example: "R-1a2b..." }
+        pickup: { $ref: "#/components/schemas/LatLng" }
+
+    RideRequestAccepted:
+      type: object
+      properties:
+        request_id: { type: string, example: "RQ-9f2c..." }
+        status: { type: string, enum: [PENDING] }
+
+    RideRequestStatus:
+      type: object
+      properties:
+        request_id: { type: string }
+        status:
+          type: string
+          enum: [PENDING, BATCHED, MATCHED, UNMATCHED, CANCELLED]
+        match:
+          nullable: true
+          allOf: [{ $ref: "#/components/schemas/Match" }]
+
+    Match:
+      type: object
+      properties:
+        driver_id: { type: string, example: "D-7e4d..." }
+        cost: { type: number, format: double }
+        eta_seconds: { type: integer, example: 240 }
+
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+        request_id: { type: string, description: "for tracing/support" }
+
+  responses:
+    BadRequest:
+      description: Malformed request.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Unauthorized:
+      description: Missing or invalid API key.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    NotFound:
+      description: Resource not found (or not visible to this tenant).
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    RateLimited:
+      description: Per-key rate limit exceeded.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
