@@ -36,4 +36,4 @@ Read in roughly this order.
 ## Status legend
 Throughout these docs: ✅ done · 🚧 in progress · ⬜ not started.
 
-Current position: **Week 2 of 24 complete** (Coordinate generator + Quadtree). See the TDD for the full schedule.
+Current position: **Week 3 of 24 complete** (Coordinate generator + Quadtree + optimal MCMF assignment matcher). See the TDD for the full schedule.

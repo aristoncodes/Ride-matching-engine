@@ -53,21 +53,22 @@ This is the single source of truth for the 24-week schedule. Each week states it
 *Intent: a spatial index that answers "who's near here?" in ~O(log N) instead of scanning everyone.*
 
 - ✅ **Already solid:** memory-safe (`unique_ptr` children, copies deleted), a `MAX_DEPTH` cap that kills infinite recursion on coincident points, and correctness verified against a brute-force scan (0 mismatches).
-- **Add `remove(point)`.** In the real system drivers go offline or get claimed. A static, insert-only tree can't model that — you need removal (and it should collapse empty subtrees so the tree doesn't bloat).
-- **Add convenience API.** `size()`, `clear()`, and a **`nearestNeighbor(point)`** wrapper that hides the expand-and-retry box search. Right now that logic lives in `main`; it belongs inside the class so every caller gets it right.
-- **_(stretch)_ Benchmark harness.** A small timing loop comparing `insert`/`queryRange` against brute force, printing the speedup. This is the first place you can put a real number behind the "fast" claim.
+- ✅ **`remove(point)`.** Removes by id and collapses a subtree of 4 undivided children back into their parent once it fits within `capacity`, so long-running insert/remove churn doesn't bloat the tree.
+- ✅ **Convenience API.** `size()`, `clear()`, and a **`nearestNeighbor(point)`** wrapper that hides the expand-and-retry box search — `match_demo.cpp` now calls it directly instead of reimplementing the search inline.
+- ✅ _(stretch)_ **Benchmark harness** (`benchmark.cpp`). Quadtree vs. brute-force nearest-neighbor timing at N = 100 .. 500,000, with a checksum cross-check between the two so a correctness regression shows up as a `[MISMATCH]`, not just a suspicious number. Speedup grows cleanly with N (O(log N) vs O(N)): ~0.3x at N=100 (tree overhead dominates at tiny sizes) up to ~160x at N=500,000.
 - ✅ **Checkpoint:** insert, query, *and* remove all covered, with the nearest-neighbor search encapsulated behind one clean call.
 
-#### Week 3 · Jul 23, 2026 · Bipartite Graphs — ⬜ Not started
-**Baseline deliverable:** The Hungarian Algorithm or Min-Cost Max-Flow (MCMF) implemented in C++ from scratch.
+#### Week 3 · Jul 23, 2026 · Bipartite Graphs — ✅ Complete *(current position)*
+**Baseline deliverable:** The Hungarian Algorithm or Min-Cost Max-Flow (MCMF) implemented in C++ from scratch. → **MCMF chosen** (`mcmf.{h,cpp}`), because it handles rectangular N≠M natively and composes with the sparse candidate stretch goal.
 *Intent: assign riders to drivers optimally — minimum total cost, each driver used once.*
 
-- **Separate concerns.** Keep **cost-matrix construction** (distances, sourced from the quadtree) apart from the **solver**. A pure solver that takes a matrix and returns an assignment is far easier to test and reuse.
-- **Handle rectangular N×M.** Riders rarely equal drivers. Either pad the matrix with dummy rows/columns (zero-cost) or model it as Min-Cost Max-Flow, which handles imbalance naturally.
-- **Prove optimality.** For small inputs (N ≤ 8), brute-force every permutation and assert your solver matches the true optimum. This is the correctness anchor — graph-matching bugs are subtle and silent.
-- **Define the overflow policy.** When N > M (as you already saw with the greedy matcher), decide explicitly what happens to unmatched riders: re-queue for the next batch, or reject with a clear signal. Document it.
-- **_(stretch)_ Sparse cost matrix.** Instead of a dense N×M, use the quadtree to give each rider only its **k-nearest driver candidates**. A dense matrix is O(N·M) to even build; the sparse version is what actually holds sub-millisecond at scale.
-- ✅ **Checkpoint:** solver returns a provably optimal assignment on small cases and a sane policy for leftovers on large ones.
+- ✅ **Separated concerns.** `mcmf.{h,cpp}` is a pure, domain-agnostic Min-Cost Max-Flow primitive. `assignment.{h,cpp}` models the rider/driver problem as a flow network on top of it (source→riders→drivers→sink, unit capacities). `cost_matrix.{h,cpp}` is the *only* file that knows about coordinates/distances — it emits the `MatchEdge` list the solver consumes. The solver never sees a coordinate.
+- ✅ **Handles rectangular N×M** natively via the flow model — no dummy padding. Max flow = min(N, M); the imbalance falls out of the graph structure.
+- ✅ **Proved optimality.** `assignment_test.cpp` checks the solver against a brute-force min-cost-max-matching oracle over **3000 randomized cases** (all dims 0–8, random costs) plus explicit edge cases (empty, 1×1, N>M, M>N, edgeless-rider, and a greedy-trap where greedy = 101 but optimal = 4). **29,683 assertions, 0 failures.** Wired into CTest (`ctest` green).
+- ✅ **Overflow policy defined & documented** (in `assignment.h`): unmatched riders (N>M, or a sparse rider with no candidate edges) return `riderToDriver[i] == -1` with a correct `matchedCount`; the solver never silently drops or mis-assigns. The re-queue-vs-reject decision is explicitly left to the service layer (Week 12 batcher).
+- ✅ **_(stretch)_ Sparse cost matrix** done. `QuadTree::kNearest(x, y, k)` feeds each rider only its k nearest drivers → O(N·k) edges instead of O(N·M). Measured on N=M=600: dense solve ~1000ms over 360k edges vs. sparse ~18ms over 4800 edges — a ~55× solve speedup for a small, quantified match-quality tradeoff (sparse may leave a few far-flung riders unmatched). Demo: `optimal_match.cpp`.
+- ✅ **Checkpoint met:** solver returns a provably optimal assignment on small cases and a documented leftover policy on large/imbalanced ones.
+- **Known follow-up (Week 5 perf):** the MCMF shortest-path is SPFA-based (O(F·V·E)); dense large inputs are slow (~10s at N=M=1000). Dijkstra-with-potentials is the planned speedup. Correctness is not affected.
 
 #### Week 4 · Jul 30, 2026 · Contraction Hierarchies (Dijkstra / A\*) — ⬜ Not started
 **Baseline deliverable:** Dijkstra's Algorithm or A\* Search implemented in C++ for accurate travel times.

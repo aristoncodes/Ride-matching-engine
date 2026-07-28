@@ -41,7 +41,7 @@ flowchart TB
     subgraph CppCore["C++ Core Engine"]
       qt["Quadtree\n(spatial index) ✅"]
       router["Router\n(Dijkstra / A*)"]
-      matcher["Bipartite Matcher\n(Hungarian / MCMF)"]
+      matcher["Bipartite Matcher\n(MCMF) ✅"]
     end
     redis[("Redis GEO")]
     queue[("Message Queue")]
@@ -57,7 +57,7 @@ flowchart TB
     bridge --> batcher
 ```
 
-Legend: ✅ = implemented (Week 2). Everything else is scheduled per the TDD.
+Legend: ✅ = implemented (Quadtree Week 2, MCMF matcher Week 3). Everything else is scheduled per the TDD.
 
 ## 3. The Critical Path: a ride request end-to-end
 

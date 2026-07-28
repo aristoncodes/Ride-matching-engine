@@ -9,7 +9,6 @@
 #include <iostream>
 #include <vector>
 #include <random>
-#include <limits>
 #include <cmath>
 #include "quadtree.h"
 
@@ -38,42 +37,16 @@ int main() {
     QuadTree driverTree(worldBounds, 4);
     for (const auto& d : drivers) driverTree.insert(d);
 
-    // Match each rider to its nearest driver.
+    // Match each rider to its nearest driver. The expand-and-retry box
+    // search now lives inside QuadTree::nearestNeighbor (Week 2 cleanup) —
+    // every caller gets a correct search instead of reimplementing it.
     for (const auto& rider : riders) {
-        int    bestId     = -1;
-        double bestDistSq = std::numeric_limits<double>::max();
-
-        // queryRange returns everything inside a BOX; search a box of
-        // half-extent `radius`, filter by true distance, and grow the box if
-        // empty (or if the best match is farther than the radius searched).
-        for (double radius = GRID_SIZE / 20.0;
-             bestId == -1 && radius <= GRID_SIZE * 2.0;
-             radius *= 2.0) {
-
-            AABB searchBox(rider.x, rider.y, radius, radius);
-            std::vector<Point> candidates;
-            driverTree.queryRange(searchBox, candidates);
-
-            for (const auto& d : candidates) {
-                double dx = d.x - rider.x;
-                double dy = d.y - rider.y;
-                double distSq = dx * dx + dy * dy;
-                if (distSq < bestDistSq) {
-                    bestDistSq = distSq;
-                    bestId = d.id;
-                }
-            }
-            // A box corner is ~1.41*radius away, and a closer driver could sit
-            // just outside the box, so only trust a match within `radius`.
-            if (bestId != -1 && std::sqrt(bestDistSq) > radius) {
-                bestId = -1;
-                bestDistSq = std::numeric_limits<double>::max();
-            }
-        }
-
-        if (bestId != -1) {
-            std::cout << "Rider R" << rider.id << " -> Driver D" << bestId
-                      << " (distance " << std::sqrt(bestDistSq) << ")\n";
+        auto match = driverTree.nearestNeighbor(rider.x, rider.y);
+        if (match) {
+            double dx = match->x - rider.x;
+            double dy = match->y - rider.y;
+            std::cout << "Rider R" << rider.id << " -> Driver D" << match->id
+                      << " (distance " << std::sqrt(dx * dx + dy * dy) << ")\n";
         } else {
             std::cout << "Rider R" << rider.id << " -> no driver found\n";
         }

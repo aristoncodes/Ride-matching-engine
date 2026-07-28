@@ -1,0 +1,20 @@
+# CMake build output — generated, machine-specific (absolute paths in cache),
+# and reproducible from source. Never commit it.
+matching_engine/build/
+build/
+
+# Compiled artifacts
+*.o
+*.obj
+*.exe
+*.out
+*.a
+*.so
+*.dylib
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
