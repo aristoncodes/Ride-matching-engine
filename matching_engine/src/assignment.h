@@ -3,6 +3,8 @@
 
 #include <vector>
 
+#include "mcmf.h"
+
 // One allowed rider->driver pairing and its (integer, pre-scaled) cost.
 // Riders and drivers are identified by contiguous indices [0, numRiders) and
 // [0, numDrivers) — NOT by their R../D.. string ids. The caller maps back.
@@ -43,7 +45,11 @@ struct Assignment {
 // re-queue-for-next-batch vs. reject-with-signal is a caller/service-layer
 // decision (see the Go Match Batcher, Week 12). The solver's contract is only:
 // "unmatched riders are reported as -1, never silently dropped or mis-assigned."
+// `engine` forwards to the min-cost-flow solver's shortest-path routine. Both
+// engines return the same optimum; the parameter exists so benchmarks and
+// tests can pin one, and production can leave it on Auto.
 Assignment solveAssignment(int numRiders, int numDrivers,
-                           const std::vector<MatchEdge>& edges);
+                           const std::vector<MatchEdge>& edges,
+                           ShortestPathEngine engine = ShortestPathEngine::Auto);
 
 #endif // ASSIGNMENT_H

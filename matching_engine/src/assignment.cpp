@@ -4,7 +4,8 @@
 #include <tuple>
 
 Assignment solveAssignment(int numRiders, int numDrivers,
-                           const std::vector<MatchEdge>& edges) {
+                           const std::vector<MatchEdge>& edges,
+                           ShortestPathEngine engine) {
     Assignment result;
     result.riderToDriver.assign(numRiders, -1);
     result.totalCost = 0;
@@ -47,7 +48,7 @@ Assignment solveAssignment(int numRiders, int numDrivers,
         chosen.emplace_back(id, e.rider, e.driver);
     }
 
-    auto [flow, cost] = mcmf.solve(source, sink);
+    auto [flow, cost] = mcmf.solve(source, sink, engine);
     result.totalCost = cost;
     result.matchedCount = static_cast<int>(flow);
 

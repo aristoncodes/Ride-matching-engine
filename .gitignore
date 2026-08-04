@@ -18,3 +18,10 @@ build/
 *~
 .idea/
 .vscode/
+
+# Sanitizer / scratch build trees
+matching_engine/build-*/
+
+# Benchmark output written by `unit_tests "[perf]"`. The committed numbers live
+# in docs/Benchmarks.md; this file is a per-run artifact.
+benchmark_results.txt

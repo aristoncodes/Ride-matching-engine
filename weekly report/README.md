@@ -9,7 +9,9 @@ Two files per week of the 24-week build:
 | 1 | Coordinate generator | [week1.md](week1.md) | [learnings1.md](learnings1.md) | ✅ |
 | 2 | Quadtree (spatial index) | [week2.md](week2.md) | [learnings2.md](learnings2.md) | ✅ |
 | 3 | Optimal matching (MCMF) | [week3.md](week3.md) | [learnings3.md](learnings3.md) | ✅ |
-| 4 | Dijkstra / A* routing | _next_ | _next_ | ⬜ |
+| 4 | Dijkstra / A* routing | [week4.md](week4.md) | [learnings4.md](learnings4.md) | ✅ |
+| 5 | Advanced testing (Catch2) | [week5.md](week5.md) | [learnings5.md](learnings5.md) | ✅ |
+| 6 | Go, goroutines, cgo/gRPC | _next_ | _next_ | ⬜ |
 
 For the full 24-week schedule and design rationale, see
 [../docs/Technical_Design_Document.md](../docs/Technical_Design_Document.md).
