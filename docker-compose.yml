@@ -1,0 +1,193 @@
+# The whole polyglot stack, in one command.
+#
+#   docker compose up --build
+#
+# Services:
+#   redis            durable ride-request queue (ADR-0006) + live driver locations (ADR-0004)
+#   matching-engine  the C++ solver, behind gRPC (ADR-0002)
+#   ingestd          driver GPS ingestion over WebSockets  -> Redis GEO
+#   requestd         rider REST front door                 -> Redis Streams
+#   batcherd         pops requests, batches, calls the engine
+#
+# NOTE: there is deliberately no Kafka here. ADR-0006 chose Redis Streams over
+# Kafka specifically so this file would not need a second stateful system, and
+# the TDD's Week 14 line predates that decision.
+
+name: ride-matching
+
+services:
+  # --------------------------------------------------------------------------
+  redis:
+    # Pinned to a patch version, never :latest. An image built today and one
+    # built in six months must contain the same Redis, or "works on my machine"
+    # becomes a real and unfalsifiable claim.
+    image: redis:8.0.3-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      # AOF on, because this Redis holds the ride-request QUEUE. ADR-0006 names
+      # in-memory durability as the accepted downside of Redis Streams over
+      # Kafka; `appendfsync everysec` is the mitigation it calls for, bounding
+      # worst-case loss to about one second of requests rather than everything.
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      # An eviction policy is a correctness decision here, not a tuning knob.
+      # The default (noeviction) makes writes fail when memory fills, which is
+      # LOUD and correct: silently evicting keys would drop ride requests, and
+      # any allkeys-lru policy would do exactly that under pressure.
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-512mb}
+      - --maxmemory-policy
+      - noeviction
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      # PING rather than a TCP connect: Redis accepts connections while still
+      # loading the AOF, and answering PING means it is genuinely ready.
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # --------------------------------------------------------------------------
+  matching-engine:
+    build:
+      # The repo root, because the engine's Dockerfile needs BOTH
+      # matching_engine/ and docs/api/matching.proto — the contract lives
+      # outside the service that implements it.
+      context: .
+      dockerfile: matching_engine/Dockerfile
+    image: ride-matching/engine:${TAG:-dev}
+    restart: unless-stopped
+    command:
+      - --port
+      - "50051"
+      # Road graph mounted, not baked in: it changes on a different schedule
+      # from the code, and a country-sized extract would be gigabytes.
+      - --graph
+      - ${ROAD_GRAPH_ID:-blr-central}=/data/bengaluru_roads.osm
+      # Per-batch caps. Raised above the default 5000 so the Week 15 complexity
+      # sweep can probe past it; a real deployment should set these to what the
+      # batch window can actually solve in time, not to the largest number that
+      # fits in memory.
+      - --max-riders
+      - ${ENGINE_MAX_RIDERS:-20000}
+      - --max-drivers
+      - ${ENGINE_MAX_DRIVERS:-20000}
+    volumes:
+      - ./matching_engine/data:/data:ro
+    ports:
+      - "${ENGINE_PORT:-50051}:50051"
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 2 bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/50051'"]
+      interval: 5s
+      timeout: 3s
+      # Generous, because the engine parses the OSM extract at startup (~130 ms
+      # for Bengaluru, far longer for a bigger graph) and must not be declared
+      # unhealthy while doing legitimate work.
+      start_period: 20s
+      retries: 5
+
+  # --------------------------------------------------------------------------
+  ingestd:
+    build:
+      context: .
+      dockerfile: infrastructure/Dockerfile
+      args:
+        SERVICE: ingestd
+    image: ride-matching/ingestd:${TAG:-dev}
+    restart: unless-stopped
+    command:
+      - --addr=:8080
+      - --redis=redis:6379
+      - --tenant=${TENANT_ID:-default}
+      - --window=${BATCH_WINDOW:-3s}
+      - --ttl=${DRIVER_TTL:-30s}
+    ports:
+      - "${INGEST_PORT:-8080}:8080"
+    depends_on:
+      redis:
+        # NOT just `depends_on: [redis]`, which only waits for the container to
+        # START. Redis accepts TCP before it has loaded its AOF, so without
+        # `service_healthy` the Go services race it and fail their first writes.
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # --------------------------------------------------------------------------
+  requestd:
+    build:
+      context: .
+      dockerfile: infrastructure/Dockerfile
+      args:
+        SERVICE: requestd
+    image: ride-matching/requestd:${TAG:-dev}
+    restart: unless-stopped
+    command:
+      - --addr=:8081
+      - --redis=redis:6379
+      - --tenant=${TENANT_ID:-default}
+    ports:
+      - "${REQUEST_PORT:-8081}:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # /readyz, not /healthz: this service is useless without a reachable
+      # queue, and the whole point of splitting the two probes (Week 11) is that
+      # readiness is the one that gates traffic.
+      test: ["CMD", "/healthcheck", "http://127.0.0.1:8081/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # --------------------------------------------------------------------------
+  batcherd:
+    build:
+      context: .
+      dockerfile: infrastructure/Dockerfile
+      args:
+        SERVICE: batcherd
+    image: ride-matching/batcherd:${TAG:-dev}
+    restart: unless-stopped
+    command:
+      - --redis=redis:6379
+      - --engine=matching-engine:50051
+      - --metrics-addr=:8082
+      - --tenant=${TENANT_ID:-default}
+      - --window=${BATCH_WINDOW:-3s}
+      - --max-batch=${MAX_BATCH:-500}
+      - --candidates=${CANDIDATES_PER_RIDER:-8}
+    ports:
+      - "${BATCHER_PORT:-8082}:8082"
+    depends_on:
+      redis:
+        condition: service_healthy
+      matching-engine:
+        # Ordering that matters: the batcher probes the engine at startup to
+        # warm the gRPC connection (see cmd/batcherd — a cold connection cost
+        # it the first batch of every run). Starting before the engine listens
+        # would make that probe fail and put the cold-start bug straight back.
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://127.0.0.1:8082/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  # Named, not a bind mount: the AOF is the queue's durability, and it must
+  # survive `docker compose down` without depending on host filesystem
+  # permissions. `down -v` is the explicit way to discard it.
+  redis-data:

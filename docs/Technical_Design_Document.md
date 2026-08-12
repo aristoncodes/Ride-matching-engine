@@ -203,7 +203,7 @@ This is the single source of truth for the 24-week schedule. Each week states it
 - ✅ **Checkpoint met:** light load flushes on the **timer** (3 riders, 3 matched, rate 1.00); heavy load flushes on **size** before a deliberately-long window can fire. Verified end to end with all four services running: 30 riders / 44 candidate drivers / 17 matched / solve 1 ms, and the 13 unmatched left correctly pending.
 - **Bug found only by running it:** the first batch after every start timed out. `grpc.NewClient` dials lazily, so the first RPC paid TCP + HTTP/2 setup — over a second on a loaded machine, against a `SolveTimeout` of window/2 — while the solve itself takes ~6 ms. Every batcher restart would have lost its first batch to a full reclaim cycle. Fixed by probing `Health` at startup, which both warms the connection and fails fast on a bad address.
 
-#### Week 13 · Oct 1, 2026 · Go Mutexes & Distributed Locking — ✅ Complete *(current position — Phase 3 done)*
+#### Week 13 · Oct 1, 2026 · Go Mutexes & Distributed Locking — ✅ Complete *(Phase 3 done)*
 
 **Baseline deliverable:** Distributed locks guaranteeing two riders are never matched to the same driver simultaneously.
 *Intent: guarantee two riders never grab the same driver at once.*
@@ -223,21 +223,32 @@ This is the single source of truth for the 24-week schedule. Each week states it
 
 **Phase goal:** Prove the hybrid system works under intense simulated pressure.
 
-#### Week 14 · Oct 8, 2026 · Docker Compose Basics — ⬜ Not started
-**Baseline deliverable:** A `docker-compose.yml` booting up Go, C++, Redis, and Kafka together.
+#### Week 14 · Oct 8, 2026 · Docker Compose Basics — ✅ Complete
+**Baseline deliverable:** A `docker-compose.yml` booting up the Go services, the C++ engine, and Redis together.
 *Intent: one command boots the whole polyglot stack.*
 
-- **Ordered startup.** **Healthchecks + `depends_on: condition: service_healthy`** so Go doesn't start hammering Redis/Kafka before they're ready.
-- **Reproducible builds.** **Pin image versions**; keep secrets and config in env files, not committed into the compose file.
-- ✅ **Checkpoint:** `docker compose up` yields a healthy Go + C++ + Redis + Kafka stack every time.
+> **Amended Aug 13, 2026.** This week originally said "Go, C++, Redis, **and Kafka**", written in Week 0 before the broker was chosen. [ADR-0006](adr/0006-redis-streams-over-kafka.md) (Week 10) selected **Redis Streams over Kafka** specifically so there would be no second stateful system to run — and avoiding exactly this compose file was one of the stated reasons. Including a Kafka broker that nothing connects to would contradict the architecture and make the stack heavier for no benefit. The stack is therefore: `redis`, `matching-engine` (C++), `ingestd`, `requestd`, `batcherd`.
 
-#### Week 15 · Oct 15, 2026 · Load Testing Basics — ⬜ Not started
+- ✅ **Ordered startup.** `depends_on: condition: service_healthy`, not the bare form — plain `depends_on` waits only for the container to START, and Redis accepts TCP before it has finished loading its AOF, so the Go services would race it and fail their first writes. Redis is probed with `redis-cli ping` rather than a TCP connect for exactly that reason.
+- ✅ **Reproducible builds.** Every image pinned to a patch version (`redis:8.0.3-alpine`, `debian:bookworm-20250630-slim`), and every apt package version-pinned to what those bases actually ship. Config lives in `.env` (see `.env.example`), never in the compose file.
+- ✅ **Multi-stage everywhere.** C++: a builder with gRPC's dev headers (~1 GB) produces a **179 MB** runtime with only the shared libraries. Go: one parameterised Dockerfile for all three services, `CGO_ENABLED=0`, runtime `FROM scratch` → **18–31 MB** images with no shell, no package manager, and nothing to patch for CVEs. All run as a non-root uid.
+- ✅ **A healthcheck that works on `scratch`.** There is no shell, so `HEALTHCHECK CMD curl …` cannot run at all. `cmd/healthcheck` is a tiny static Go probe compiled into each image and invoked in exec form. `requestd` probes **`/readyz`** rather than `/healthz`, since a front door with no reachable queue should not receive traffic.
+- ✅ **Checkpoint met:** `docker compose up` brought all five services to `healthy` in **12–13 s across three consecutive cold cycles** (`down -v` between each), and the full flow was verified through the containers — 50 drivers over WebSockets, 25 riders over REST, 14 matched, 0 solve errors.
+- **Bug found by containerising:** the batcher's startup engine-probe timed out. `Client.Health` caps at the client's 2 s default, and a *first* gRPC connection inside Docker (DNS + TCP + HTTP/2) exceeds it — so the Week 12 cold-start fix silently stopped working in the environment it mattered most. Fixed with a longer client timeout plus retry; the probe now succeeds on attempt 1.
+
+#### Week 15 · Oct 15, 2026 · Load Testing Basics — ✅ Complete *(current position — Phase 4 done)*
+
 **Baseline deliverable:** A Go script simulating 10,000 concurrent drivers, proving latency is near O(N log M).
 *Intent: turn the performance goals into measured evidence.*
 
-- **Percentiles, not averages.** Report **p50 / p95 / p99** latency — tail latency is the entire point of surviving spikes, and averages hide it.
-- **Validate the complexity claim.** **Plot measured latency against N** and confirm it tracks O(N log M) rather than O(N·M).
-- ✅ **Checkpoint:** a committed report shows p99 latency at 10k drivers and a curve matching the claimed complexity.
+- ✅ **`cmd/loadtest`, two modes.** `--mode=pipeline` drives the real stack end to end (WebSockets + REST); `--mode=sweep` talks straight to the engine over gRPC to test the algorithmic claim without network noise. Percentiles come from the full sample set (exact, nearest-rank), not a running mean.
+- ✅ **Percentiles, not averages.** **10,000 concurrent drivers connected, 0 failed, 0 refused, in 1.6 s.** Request latency: **p50 405 µs, p95 3.14 ms, p99 8.35 ms**, max 19.76 ms over 2,000 requests at 399/s — 2,000 accepted, **2,000 matched, 0 errors**. Reports committed to [Load_Test_Pipeline.md](Load_Test_Pipeline.md) and [Load_Test_Sweep.md](Load_Test_Sweep.md).
+- ⚠️ **The complexity claim is HALF WRONG, and the report says so.** Sweeping N and M independently:
+  - **M (drivers): confirmed, emphatically.** 32× the drivers (500 → 16,000) costs only **~2× the time** — each doubling multiplies by 1.02–1.27 against the 2.0 an O(N·M) design would show. The Week 2 quadtree shortlist does exactly what it was built for.
+  - **N (riders): the claim is wrong.** Doubling N multiplies time by 1.5–4.7, and 32× the riders costs **~100× the time (≈O(N^1.33))**. This is not a bug but a misdescription: Successive Shortest Paths runs **one augmentation per matched rider**, each a shortest-path search over a graph with O(N·k) edges, so the solve is nearer **O(N²k log N)**. The `log M` term is real and belongs to the *candidate lookup*, not the solve.
+  - **Dense control:** ~O(N^2.9) — at N=M=800 a dense solve takes **~2 s**, past the batch window on its own. That is the measured justification for the sparse path.
+- ✅ **The finding changed an operational decision.** Because cost is superlinear in N, **`MAX_BATCH` is a latency control, not merely a memory bound**: one 3200-rider batch takes ~328 ms, while four 800-rider batches total ~158 ms for the same riders — faster, at some cost in match quality since each optimises over a smaller pool.
+- ✅ **Checkpoint met:** a committed report shows p99 at 10k drivers and the measured curves — including where they contradict the original claim.
 
 ---
 

@@ -1,0 +1,17 @@
+# Build context hygiene. Everything here is either a build product, machine
+# specific, or irrelevant to an image — and every byte sent to the daemon slows
+# the build and can bust a layer cache.
+
+.git
+.github
+**/build/
+**/build-*/
+infrastructure/gen/
+matching_engine/gen/
+matching_engine/data/
+weekly report/
+docs/
+!docs/api/matching.proto
+*.md
+.DS_Store
+**/benchmark_results.txt

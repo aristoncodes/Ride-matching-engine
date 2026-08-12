@@ -88,7 +88,12 @@ func main() {
 	}
 	cancelPing()
 
-	eng, err := engine.Dial(*engineAddr)
+	// A generous CLIENT timeout, deliberately. It is an upper bound, not the
+	// per-call budget: SolveBatch is separately bounded by cfg.SolveTimeout and
+	// context.WithTimeout never extends an existing deadline, so solves are
+	// still governed by the window. What this buys is room for the startup
+	// probe below, whose first connection is much slower than steady state.
+	eng, err := engine.Dial(*engineAddr, engine.WithTimeout(10*time.Second))
 	if err != nil {
 		logger.Error("could not configure the engine client", "err", err)
 		os.Exit(1)
@@ -110,16 +115,35 @@ func main() {
 	// Not fatal if it fails: the engine may simply be starting up alongside us,
 	// and the retry path handles that correctly. The point is to pay the setup
 	// cost here rather than inside a rider's batch.
-	warmCtx, cancelWarm := context.WithTimeout(context.Background(), 10*time.Second)
-	health, warmErr := eng.Health(warmCtx)
-	cancelWarm()
+	// Retried, because a single attempt is not enough in practice. Two distinct
+	// slow paths overlap here: the engine may still be parsing its road graph,
+	// and the very first gRPC connection has to do DNS, TCP and an HTTP/2
+	// handshake — which inside Docker took longer than the client's 2s default
+	// and made a single-shot probe fail even against a container compose had
+	// already marked healthy.
+	var health *matchingv1.HealthResponse
+	var warmErr error
+	warmDeadline := time.Now().Add(45 * time.Second)
+	for attempt := 1; time.Now().Before(warmDeadline); attempt++ {
+		warmCtx, cancelWarm := context.WithTimeout(context.Background(), 10*time.Second)
+		health, warmErr = eng.Health(warmCtx)
+		cancelWarm()
+		if warmErr == nil {
+			logger.Info("matching engine reachable",
+				"addr", *engineAddr, "version", health.GetVersion(),
+				"graphs", len(health.GetLoadedGraphs()), "attempts", attempt)
+			break
+		}
+		logger.Warn("matching engine not reachable yet; retrying",
+			"addr", *engineAddr, "attempt", attempt, "err", warmErr)
+		time.Sleep(2 * time.Second)
+	}
 	if warmErr != nil {
-		logger.Warn("could not reach the matching engine at startup; "+
-			"continuing and will retry per batch", "addr", *engineAddr, "err", warmErr)
-	} else {
-		logger.Info("matching engine reachable",
-			"addr", *engineAddr, "version", health.GetVersion(),
-			"graphs", len(health.GetLoadedGraphs()))
+		// Still not fatal: the engine may be genuinely down, and the retry path
+		// handles that correctly by requeueing batches rather than losing them.
+		logger.Error("could not reach the matching engine at startup; "+
+			"continuing, but the first batches will fail and requeue",
+			"addr", *engineAddr, "err", warmErr)
 	}
 
 	metric := matchingv1.CostMetric_COST_METRIC_EUCLIDEAN

@@ -19,11 +19,14 @@ Two files per week of the 24-week build:
 | 11 | REST API standards | [week11.md](week11.md) | [learnings11.md](learnings11.md) | ✅ |
 | 12 | Match Batcher microservice | [week12.md](week12.md) | [learnings12.md](learnings12.md) | ✅ |
 | 13 | Distributed locking | [week13.md](week13.md) | [learnings13.md](learnings13.md) | ✅ |
-| 14 | Docker Compose | _next_ | _next_ | ⬜ |
+| 14 | Docker Compose | [week14.md](week14.md) | [learnings14.md](learnings14.md) | ✅ |
+| 15 | Load testing | [week15.md](week15.md) | [learnings15.md](learnings15.md) | ✅ |
+| 16 | Kubernetes basics | _next_ | _next_ | ⬜ |
 
 **Phase 1** (C++ core, weeks 1–5) · **Phase 2** (Go bridge & ingestion, weeks 6–9) ·
-**Phase 3** (message brokering & batching, weeks 10–13) — **all complete.**
-Phase 4 (DevOps & benchmarking) starts at week 14.
+**Phase 3** (message brokering & batching, weeks 10–13) ·
+**Phase 4** (DevOps & benchmarking, weeks 14–15) — **all complete.**
+Phase 5 (production orchestration) starts at week 16.
 
 For the full 24-week schedule and design rationale, see
 [../docs/Technical_Design_Document.md](../docs/Technical_Design_Document.md).

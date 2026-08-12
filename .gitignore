@@ -31,3 +31,6 @@ benchmark_results.txt
 # waiting to go stale.
 infrastructure/gen/
 matching_engine/gen/
+
+# Local compose env (may contain machine-specific config)
+.env
