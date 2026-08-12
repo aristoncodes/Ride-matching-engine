@@ -25,3 +25,9 @@ matching_engine/build-*/
 # Benchmark output written by `unit_tests "[perf]"`. The committed numbers live
 # in docs/Benchmarks.md; this file is a per-run artifact.
 benchmark_results.txt
+
+# Generated protobuf/gRPC stubs. Build products of docs/api/matching.proto —
+# regenerate with `make proto`. A checked-in copy is a second source of truth
+# waiting to go stale.
+infrastructure/gen/
+matching_engine/gen/

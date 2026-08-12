@@ -84,7 +84,7 @@ This is the single source of truth for the 24-week schedule. Each week states it
 - ✅ **Checkpoint met:** two points on the road graph return an optimal route and its travel time, matching Dijkstra's cost exactly. **Result that justifies the week:** road-time matching changes **63% of pairings** and saves **9.5% of total rider waiting** vs distance matching, on the same solver. Mean detour factor **1.51×** — the multiplier by which straight-line distance was lying. See `docs/Benchmarks.md` §3–4.
 - **Noted, not fixed:** minimising the *sum* of waits let the *worst* individual wait rise (8.7 → 9.3 min). Not a bug — a sum has no opinion about its largest term. A per-rider ceiling is a constraint to add to the model, and is deferred to the service layer.
 
-#### Week 5 · Aug 6, 2026 · Advanced Testing — ✅ Complete *(current position)*
+#### Week 5 · Aug 6, 2026 · Advanced Testing — ✅ Complete
 
 **Baseline deliverable:** Rigorous C++ unit tests guaranteeing the pairing matrix computes in sub-millisecond time.
 *Intent: turn "seems to work" into "provably works, this fast."*
@@ -104,40 +104,57 @@ This is the single source of truth for the 24-week schedule. Each week states it
 
 **Phase goal:** Establish the polyglot architecture and real-time data ingestion pipelines.
 
-#### Week 6 · Aug 13, 2026 · Go, Goroutines, cgo/gRPC — ⬜ Not started
+#### Week 6 · Aug 13, 2026 · Go, Goroutines, cgo/gRPC — ✅ Complete
+
 **Baseline deliverable:** A Go wrapper that passes mock data to the C++ engine and receives the match array back.
 *Intent: let Go drive the C++ brain without the two crashing each other.*
 
-- **Prefer gRPC + Protobuf over cgo.** Running C++ as a separate process behind gRPC gives **failure isolation** — a C++ segfault returns an error instead of taking down the Go process. That directly serves the "fail-safe orchestration" tenet; cgo couples their lifetimes.
-- **Schema first.** Write the **`.proto`** before the code and treat it as the binding contract between the two languages.
-- **Bound every call.** A **timeout + context cancellation** on each request into C++ so a hung or slow worker can never block the Go layer indefinitely.
-- ✅ **Checkpoint:** Go sends a batch, gets the match array back, and survives a deliberately-killed C++ worker with a clean error.
+- ✅ **gRPC over cgo, and now validated** (ADR-0002 moved Proposed → **Accepted**). `matching_server` runs the engine as its own process; `MatchingService` (`matching_service.{h,cpp}`) implements `SolveBatch`/`Health` on top of the untouched Week 1–5 solver. `graph_registry.{h,cpp}` loads road graphs **at startup** — a ~130 ms parse inside a request would blow every batch deadline — and is immutable afterwards, which is why the service needs no locks at all.
+- ✅ **Schema first, and the schema was revised before any code existed.** Reconciling `matching.proto` with what the engine does post-Week-4 produced: typed cost fields (the old untyped `double cost` changed unit with the metric — a genuine cross-language trap), `road_graph_id`, `max_candidates_per_rider`, `max_pairing_cost`, and per-rider `UnmatchedReason`. Removed tags are `reserved`, and the compatibility rules are written into the file.
+- ✅ **Every call bounded.** `internal/engine.Client` imposes a deadline (default 2 s, sized against the 3 s batch window) *and* honours caller cancellation — different things: the deadline stops a hung engine, cancellation lets a caller abandon work it no longer needs.
+- ✅ **Typed failure taxonomy** (`errors.go`) answering the only question the service layer asks: retry or poison? `ErrEngineUnavailable`/`ErrTimeout` are retryable; `ErrInvalidBatch`/`ErrGraphNotLoaded`/`ErrBatchTooLarge` are not. An unrecognised error defaults to retryable, because dropping a real ride request is worse than retrying a stateless call.
+- ✅ **Checkpoint met, automated:** `TestSurvivesEngineCrash` **SIGKILLs** the C++ process mid-run and asserts the Go process survives, gets a typed retryable error, and **recovers by itself** when the engine restarts. An isolation story that needs the Go layer restarted to recover is not isolation.
+- ✅ **Tests:** 15 C++ service cases (contract semantics: error codes, unmatched reasons, which fields are set under which metric) + 9 Go integration tests against the real binary. No mocks at the boundary — a mock returning `Unavailable` only proves the mock was written to.
+- **Deliberately deferred:** `road_distance_meters` is left unset in batch responses. Recovering it means routing every matched pair a second time (~0.6 ms each, doubling batch cost) for a number the caller does not need to dispatch. The field is `optional` precisely so absent is a legal answer.
 
-#### Week 7 · Aug 20, 2026 · Redis GEOADD/GEORADIUS — ⬜ Not started
+#### Week 7 · Aug 20, 2026 · Redis GEOADD/GEORADIUS — ✅ Complete
+
 **Baseline deliverable:** A Redis instance plus Go code to store driver locations and perform spatial updates.
 *Intent: a fast, shared store of live driver locations.*
 
-- **Hide Redis behind an interface.** Wrap `GEOADD`/`GEORADIUS` in a small repository type so it can be mocked in tests and swapped later.
-- **Expire stale data.** Give locations a **TTL** so a driver who stopped pinging ages out instead of being matched as if present.
-- **Resilient connections.** **Connection pooling** plus retry-with-backoff on transient Redis errors.
-- ✅ **Checkpoint:** driver locations update in Redis and a radius query returns only recently-seen drivers.
+- ✅ **Interface first.** `locations.Repository` is defined before the Redis implementation, so the ingestor and batcher depend on the interface and are tested against an in-memory fake with no Redis at all.
+- ✅ **TTL, solved properly.** Redis has **no per-member expiry** — a geo set is a sorted set, and `EXPIRE` on it would drop every driver in the city at once. So freshness lives in a companion ZSET (`drivers:seen:<tenant>`, score = last-ping unix ms), making "is this driver fresh?" an O(log N) score range. Reads filter by it **and** a background reaper deletes by it: filtering alone leaves dead drivers in memory forever, reaping alone serves stale drivers between sweeps. Both are required.
+- ✅ **Resilience.** Pooling (`PoolSize`), dial/read/write timeouts (without them a partition blocks a goroutine for minutes), and retry with **exponential backoff plus jitter** — the jitter matters, since without it every goroutine that failed on a Redis restart retries in lockstep and stampedes the recovering server. Retries are restricted to genuinely transient errors: a `WRONGTYPE` is a bug, and retrying it just fails three times as slowly.
+- ✅ **Checkpoint met:** `TestStaleDriversAreNotReturned` — with an injected clock, a driver that stops pinging disappears from radius results at the TTL while one that keeps pinging does not, and the stale entry is proven to still occupy memory until reaped.
+- ✅ **Tests:** 10 cases against a **real redis-server** on a private unix socket per test. Includes concurrent-writer safety under `-race`, upsert-replaces-not-appends, and Redis being killed mid-flight.
+- **Bug worth recording:** tests failed only for those with LONG NAMES. A unix socket path is capped at `sun_path` = 104 bytes on macOS, and Go's `t.TempDir()` embeds the test name, so the socket path length — and therefore the failure — was a function of the test's name.
 
-#### Week 8 · Aug 27, 2026 · WebSockets in Go — ⬜ Not started
+#### Week 8 · Aug 27, 2026 · WebSockets in Go — ✅ Complete
+
 **Baseline deliverable:** A functional WebSocket server built in Go.
 *Intent: accept thousands of live GPS streams without leaking resources.*
 
-- **Detect dead clients.** Enforce **read/write deadlines** and **ping/pong heartbeats** — TCP can hold a "connection" open long after the client is gone.
-- **Set limits.** Bound **message size** and **max concurrent connections** so one abusive client can't exhaust memory.
-- **No goroutine leaks.** One goroutine per connection, each with **clean shutdown on context cancel**.
-- ✅ **Checkpoint:** clients connect, stream, and disconnect cleanly; killing a client frees its goroutine.
+- ✅ **Dead-client detection.** Server-side ping every 54 s against a 60 s read deadline (~90%, tolerating one lost ping), with the deadline pushed forward on every pong *and* on any traffic. This is the only thing that finds a phone in a tunnel: TCP will hold the socket open indefinitely.
+- ✅ **Limits.** `MaxConnections` is checked **before** the upgrade — a 503 with `Retry-After` is cheaper and kinder than accepting a connection and tearing it down. `MaxMessageBytes` (4 KB against a ~100 byte ping) stops a client announcing a 2 GB frame. Write deadlines stop a client that has stopped reading from pinning a goroutine via TCP backpressure.
+- ✅ **No leaks.** Exactly two pumps per connection (gorilla permits one concurrent reader and one writer — more is a race, not a queue), coupled by a per-connection context so whichever notices the connection has ended takes the other down.
+- ✅ **Checkpoint met, automated:** `TestNoGoroutineLeakOnClientDisconnect` — **3 goroutines before, 3 after 100 abrupt connect/disconnect cycles.** Plus the inverse test, that a *responsive* client survives 3× `PongWait`, which is what actually catches a bad ping/deadline ratio.
+- **Bug the test suite caught:** `Shutdown` timed out. `ReadMessage` does **not** return on context cancel — gorilla has no context-aware read — so an idle connection sat in a socket read until its deadline. The fix is a small goroutine per connection that closes the socket when the context ends, which is the only thing that unblocks a blocked reader.
+- **Noted, not built:** outbound server→client push. The write pump exists as a separate goroutine anyway so that when a later week pushes match results to drivers, there is one obvious place for it instead of a race.
 
-#### Week 9 · Sep 3, 2026 · Pipeline Integration — ⬜ Not started
+#### Week 9 · Sep 3, 2026 · Pipeline Integration — ✅ Complete *(current position — Phase 2 done)*
+
 **Baseline deliverable:** A Go server accepting mock GPS pings every 3 seconds and updating the Redis cache.
 *Intent: wire ingestion → cache into one flowing pipe on the 3-second cadence.*
 
-- **Config the window.** Make the **3-second batch window** a config value, and log per-window throughput (pings in, cache updates out).
-- **Backpressure.** If the C++ engine falls behind, **shed load deliberately** (drop-oldest or reject) rather than letting queues grow until the process OOMs.
-- ✅ **Checkpoint:** mock pings flow in every 3s, Redis reflects them, and the system stays bounded under overload.
+- ✅ **Configurable window** (`--window`, default 3 s per ADR-0005) with per-window throughput logged: pings in, drivers out, flush duration, shed count. `FlushTimeout > Window` is **rejected at construction** — a flush slower than the window means windows overlap and queue, which is precisely the unbounded growth this component exists to prevent.
+- ✅ **Coalescing is the core idea.** The buffer is a `map[driverID]DriverLocation`, so ten pings from one driver in a window become one write. This is not lossy: an older GPS fix is not partial information, it is *wrong* information a newer one has already superseded. Measured live: **5,438 pings → 2,000 writes**.
+- ✅ **Deliberate, counted shedding.** The bound is distinct drivers, not raw pings; past the cap new drivers are shed and counted, while updates to already-buffered drivers are still accepted (they reuse an entry, so refusing them would discard fresher data for zero memory saving). A failed flush **drops the window** rather than retrying into the next one — re-queueing would grow the buffer during exactly the outage that caused the failure, and every driver pings again in 3 seconds anyway.
+- ✅ **The lock is never held across the store write.** The buffer is swapped out under the lock and written outside it; holding it would block every connection goroutine for a Redis round trip, turning one slow dependency into a stalled ingestion layer. Asserted by `TestSlowStoreCannotBlockIngestion`.
+- ✅ **Runnable end to end.** `cmd/ingestd` (WebSocket → pipeline → Redis, graceful shutdown in the right order: stop accepting → drain connections → final flush) and `cmd/mockdrivers` (load generator).
+- ✅ **Checkpoint met, demonstrated live:**
+  - *Normal:* 500 drivers, 5,438 pings, **0 failures**, 500 drivers in Redis, `GEOSEARCH` returning nearest-first with distances.
+  - *Overload:* 600 drivers against a 200-connection / 50-driver-buffer limit → **400 refused with 503, 7,287 pings shed, 0 failures, 0 crashes**, buffer never above its cap. Bounded by design rather than by luck.
+- **Bug worth recording:** a test comparing `12.97 + 9*0.001` against a runtime-computed `12.97 + float64(9)*0.001` failed while printing two identical numbers. Go folds untyped constant arithmetic at arbitrary precision and rounds once; the runtime version rounds at every step.
 
 ---
 

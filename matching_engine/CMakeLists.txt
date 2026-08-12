@@ -47,6 +47,60 @@ add_executable(road_match_demo src/road_match_demo.cpp src/assignment.cpp src/mc
                src/cost_matrix.cpp src/quadtree.cpp src/road_graph.cpp src/router.cpp
                src/osm_loader.cpp)
 
+# 4b. Week 6: the gRPC server.
+#
+# gRPC is looked up rather than assumed: the algorithmic targets above must
+# still build on a machine that has never installed it, because the engine's
+# correctness does not depend on how it is transported. Only the server and its
+# integration test are skipped when gRPC is missing.
+find_package(Protobuf CONFIG QUIET)
+find_package(gRPC CONFIG QUIET)
+
+if(gRPC_FOUND AND Protobuf_FOUND)
+    set(GENERATED_DIR ${CMAKE_CURRENT_SOURCE_DIR}/gen)
+    set(GENERATED_SOURCES
+        ${GENERATED_DIR}/matching.pb.cc
+        ${GENERATED_DIR}/matching.grpc.pb.cc)
+
+    # Regenerate whenever the .proto is newer. `make proto` at the repo root
+    # does the same thing for both languages; this keeps a plain `cmake --build`
+    # from silently compiling stubs that no longer match the contract.
+    find_program(PROTOC_EXECUTABLE protoc REQUIRED)
+    find_program(GRPC_CPP_PLUGIN grpc_cpp_plugin REQUIRED)
+    set(PROTO_FILE ${CMAKE_CURRENT_SOURCE_DIR}/../docs/api/matching.proto)
+    add_custom_command(
+        OUTPUT ${GENERATED_SOURCES}
+               ${GENERATED_DIR}/matching.pb.h ${GENERATED_DIR}/matching.grpc.pb.h
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${GENERATED_DIR}
+        COMMAND ${PROTOC_EXECUTABLE}
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../docs/api
+                --cpp_out=${GENERATED_DIR}
+                --grpc_out=${GENERATED_DIR}
+                --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN}
+                ${PROTO_FILE}
+        DEPENDS ${PROTO_FILE}
+        COMMENT "Generating C++ gRPC stubs from matching.proto")
+
+    add_library(matching_service STATIC
+        src/matching_service.cpp src/graph_registry.cpp
+        src/assignment.cpp src/mcmf.cpp src/cost_matrix.cpp
+        src/quadtree.cpp src/road_graph.cpp src/router.cpp src/osm_loader.cpp
+        ${GENERATED_SOURCES})
+    target_include_directories(matching_service PUBLIC src ${GENERATED_DIR})
+    target_link_libraries(matching_service PUBLIC gRPC::grpc++ gRPC::grpc++_reflection
+                                                  protobuf::libprotobuf)
+
+    add_executable(matching_server src/matching_server.cpp)
+    target_link_libraries(matching_server PRIVATE matching_service)
+
+    add_executable(service_test tests/test_main.cpp tests/test_matching_service.cpp)
+    target_include_directories(service_test PRIVATE src third_party/catch2 ${GENERATED_DIR})
+    target_link_libraries(service_test PRIVATE matching_service)
+else()
+    message(STATUS "gRPC not found — skipping matching_server. "
+                   "Install with: brew install grpc protobuf")
+endif()
+
 # 5. Week 5: the test suite.
 #
 # Catch2 v2's single header is vendored in third_party/ rather than fetched at
@@ -88,3 +142,10 @@ add_test(NAME routing_end_to_end
          COMMAND route_demo ${CMAKE_CURRENT_SOURCE_DIR}/data/bengaluru_roads.osm 60)
 add_test(NAME road_matching_end_to_end
          COMMAND road_match_demo ${CMAKE_CURRENT_SOURCE_DIR}/data/bengaluru_roads.osm 40 40)
+
+# Week 6: the gRPC service's contract semantics (error codes, unmatched
+# reasons, which fields are set under which metric). Registered only when gRPC
+# was found, so a machine without it still gets a green `ctest` for the engine.
+if(gRPC_FOUND AND Protobuf_FOUND)
+    add_test(NAME service_contract COMMAND service_test)
+endif()
