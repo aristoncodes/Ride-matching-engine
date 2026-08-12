@@ -48,7 +48,7 @@ This is the single source of truth for the 24-week schedule. Each week states it
 - ✅ **Unambiguous IDs.** Riders are `R0..`, drivers are `D0..` — no collision in a combined set (see [Data_Model.md](Data_Model.md)).
 - ✅ **Checkpoint met:** the generator produces reproducible, machine-readable data on stdout, pipeable straight into another program. *(The interim matching demo was moved out to `match_demo.cpp` to keep the generator single-purpose.)*
 
-#### Week 2 · Jul 16, 2026 · Spatial Partitioning — ✅ Complete *(current position)*
+#### Week 2 · Jul 16, 2026 · Spatial Partitioning — ✅ Complete
 **Baseline deliverable:** An explicit Quadtree data structure implemented in C++ to partition 2D space.
 *Intent: a spatial index that answers "who's near here?" in ~O(log N) instead of scanning everyone.*
 

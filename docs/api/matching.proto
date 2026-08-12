@@ -6,8 +6,16 @@
 //   - The engine is STATELESS per call: Go sends a full batch (riders +
 //     candidate drivers), the engine returns the optimal assignment. No shared
 //     mutable state across calls.
-//   - This .proto is the binding contract; it is defined BEFORE either side is
-//     implemented (Week 6) and versioned thereafter.
+//   - This .proto is the binding contract. It is versioned; see the
+//     COMPATIBILITY RULES at the bottom before changing anything here.
+//
+// Revision history:
+//   v1 (drafted Week 0) — initial contract.
+//   v1 (revised Aug 5, 2026, BEFORE any stubs were generated) — reconciled
+//       with what the engine actually does now that Week 4 added road-graph
+//       routing: cost units made unambiguous, road graph selection added,
+//       the candidate cap exposed, per-rider unmatched reasons, and explicit
+//       partial-result and error semantics.
 
 syntax = "proto3";
 
@@ -15,57 +23,196 @@ package matching.v1;
 
 option go_package = "github.com/aditya/ride-matching/gen/matching/v1;matchingv1";
 
-// ---- Messages ----------------------------------------------------------
+// ---- Core types --------------------------------------------------------
 
 message LatLng {
-  double lat = 1;
-  double lng = 2;
+  double lat = 1;   // degrees, WGS84
+  double lng = 2;   // degrees, WGS84
 }
 
 message Rider {
-  string id = 1;        // "R-<uuid>"
+  string id = 1;        // "R-<uuid>"; opaque to the engine, echoed back verbatim
   LatLng pickup = 2;
 }
 
 message Driver {
-  string id = 1;        // "D-<uuid>"
+  string id = 1;        // "D-<uuid>"; opaque to the engine, echoed back verbatim
   LatLng location = 2;
 }
+
+// How a rider-driver pairing is priced.
+//
+// This choice changes the UNIT of the cost fields below, which is why they are
+// separate typed fields rather than one ambiguous `double cost`. A single
+// field whose meaning silently changes with an enum is exactly the kind of
+// cross-language trap that yields a plausible-looking wrong answer.
+enum CostMetric {
+  COST_METRIC_UNSPECIFIED = 0;
+
+  // Straight-line great-circle distance. Fast, needs no road graph.
+  // Approximate: the measured detour factor on the Bengaluru extract is
+  // ~1.51x, i.e. this understates real trips by about a third.
+  COST_METRIC_EUCLIDEAN = 1;
+
+  // Real driving time over the road graph, respecting one-ways and speeds.
+  // REQUIRES a road graph loaded on the server (see road_graph_id).
+  COST_METRIC_TRAVEL_TIME = 2;
+}
+
+// ---- Request -----------------------------------------------------------
 
 // One batch of work for a single tenant's 3-second window.
 message MatchBatchRequest {
   string tenant_id = 1;
-  string batch_id = 2;              // idempotency / tracing key
+  string batch_id = 2;                    // idempotency / tracing key
   repeated Rider riders = 3;
   repeated Driver candidate_drivers = 4;  // pre-filtered via Redis GEORADIUS
+
   CostMetric cost_metric = 5;
+
+  // Which road graph to price against, e.g. "blr-central". REQUIRED when
+  // cost_metric is COST_METRIC_TRAVEL_TIME; ignored otherwise.
+  //
+  // The engine loads graphs at STARTUP and never fetches one mid-request: a
+  // multi-second parse inside a call would blow every batch deadline. An
+  // unknown or not-yet-loaded id fails with FAILED_PRECONDITION rather than
+  // falling back to euclidean — a silent downgrade of the cost model is a
+  // correctness bug the caller has no way to see.
+  string road_graph_id = 6;
+
+  // Cap each rider's candidates to its k nearest before solving.
+  //
+  // The single biggest performance lever in the engine, so it belongs in the
+  // contract rather than baked into the server. 0 means "no cap" (a dense N*M
+  // matrix). Measured at N=M=100: k=8 solves in 0.4 ms, dense in 3.8 ms, and
+  // the gap widens sharply with batch size.
+  //
+  // The tradeoff is real and the caller owns it: a tight k can leave a rider
+  // unmatched whose only reachable driver sat just outside the shortlist.
+  // Recommended starting point: 8.
+  int32 max_candidates_per_rider = 7;
+
+  // Discard any pairing costing more than this, before solving.
+  //
+  // Exists because the solver minimises the SUM of costs, and a sum has no
+  // opinion about its largest term — it will happily make one rider wait 9
+  // minutes to save 30 seconds each for twenty others (observed in Week 4).
+  // This is the caller's lever for a per-rider ceiling. 0 means no ceiling.
+  //
+  // Unit follows cost_metric: seconds under TRAVEL_TIME, metres under
+  // EUCLIDEAN. A rider left with nothing under the cutoff comes back unmatched
+  // with ALL_CANDIDATES_ABOVE_CUTOFF — deliberately not matched to a driver
+  // who would arrive outside the promise.
+  double max_pairing_cost = 8;
 }
 
-enum CostMetric {
-  COST_METRIC_UNSPECIFIED = 0;
-  COST_METRIC_EUCLIDEAN = 1;        // straight-line (fast, approximate)
-  COST_METRIC_TRAVEL_TIME = 2;      // road-graph routing (accurate)
-}
+// ---- Response ----------------------------------------------------------
 
 message Match {
   string rider_id = 1;
   string driver_id = 2;
-  double cost = 3;
-  int32 eta_seconds = 4;
+
+  // Driving time for the driver to reach the rider. Set ONLY when the request
+  // used COST_METRIC_TRAVEL_TIME; absent under EUCLIDEAN, where the engine has
+  // no basis for an ETA. Optional precisely so a caller cannot read a default
+  // 0 as "arrives immediately".
+  optional int32 eta_seconds = 3;
+
+  // Straight-line distance between rider and driver. ALWAYS set: it is
+  // computable under either metric, and it is what makes a response auditable
+  // — an ETA of 40 s across a 6 km gap is visibly wrong.
+  double straight_line_meters = 4;
+
+  // Road distance along the chosen route. Set only under TRAVEL_TIME.
+  optional double road_distance_meters = 5;
+
+  reserved 6;
+  reserved "cost";   // v1 draft had an untyped `double cost`; see Match above
+}
+
+// Why a rider came back without a driver.
+//
+// The service layer's re-queue-vs-reject decision (Week 12 batcher) depends on
+// WHICH of these it was: "no drivers left" is worth retrying next window,
+// "unreachable" is not. The Week 3 solver already distinguishes these cases
+// internally; the earlier contract threw that information away.
+enum UnmatchedReason {
+  UNMATCHED_REASON_UNSPECIFIED = 0;
+
+  // More riders than drivers — the batch simply ran out. Retry next window.
+  UNMATCHED_REASON_NO_DRIVER_AVAILABLE = 1;
+
+  // No driver could reach this rider on the road graph at all: wrong side of a
+  // severed one-way, or outside the mapped area. Retrying will not help until
+  // the rider or the driver pool moves.
+  UNMATCHED_REASON_UNREACHABLE = 2;
+
+  // Candidates existed, but every one was above max_pairing_cost.
+  UNMATCHED_REASON_ALL_CANDIDATES_ABOVE_CUTOFF = 3;
+
+  // The rider's k-nearest shortlist came back empty. Only possible when
+  // max_candidates_per_rider is set — a hint that k is too tight.
+  UNMATCHED_REASON_NO_CANDIDATES_IN_SHORTLIST = 4;
+}
+
+message UnmatchedRider {
+  string rider_id = 1;
+  UnmatchedReason reason = 2;
 }
 
 message MatchBatchResponse {
   string batch_id = 1;
   repeated Match matches = 2;
-  repeated string unmatched_rider_ids = 3;   // when riders > drivers
-  int64 compute_micros = 4;                  // measured solve time (for SLO tracking)
+
+  // Riders with no driver, each with WHY. Replaces the v1 draft's bare
+  // `repeated string unmatched_rider_ids`, which forced the caller to guess
+  // at the one thing it needed in order to decide what to do next.
+  repeated UnmatchedRider unmatched_riders = 3;
+
+  // Wall-clock spent solving, for SLO tracking. Excludes serialization.
+  int64 compute_micros = 4;
+
+  // What the engine ACTUALLY did. The request states an intent; this states
+  // the outcome, and they can differ (a k larger than the driver pool, say).
+  // A caller tracking an SLO against an assumed configuration needs the truth,
+  // not its own assumption echoed back.
+  CostMetric cost_metric_used = 5;
+  string road_graph_id = 6;        // empty under EUCLIDEAN
+  int32 candidates_per_rider = 7;  // effective k; 0 if the matrix was dense
+
+  // Total cost of the assignment, in the unit implied by cost_metric_used
+  // (seconds under TRAVEL_TIME, metres under EUCLIDEAN). This is the quantity
+  // the solver actually minimised, exposed so match QUALITY can be tracked
+  // over time and not just latency.
+  double total_cost = 8;
+
+  reserved 9;
+  reserved "unmatched_rider_ids";
 }
 
 // ---- Service -----------------------------------------------------------
 
 service MatchingEngine {
-  // Solve one batch to an optimal assignment. Callers MUST set a deadline;
-  // the engine is expected to respond well within the batch window.
+  // Solve one batch to an optimal assignment.
+  //
+  // Callers MUST set a deadline. If it passes, the engine returns
+  // DEADLINE_EXCEEDED with NO partial assignment. Partial results are
+  // deliberately not offered: half an assignment is not a valid assignment,
+  // because the drivers it consumed are exactly the ones the rest of the batch
+  // needed. A caller cannot safely merge it with anything.
+  //
+  // Errors:
+  //   INVALID_ARGUMENT     — malformed batch: missing ids, lat/lng out of
+  //                          range, duplicate rider or driver ids
+  //   FAILED_PRECONDITION  — TRAVEL_TIME requested with an unknown or
+  //                          not-yet-loaded road_graph_id
+  //   DEADLINE_EXCEEDED    — could not finish in time. Safe to retry: the call
+  //                          is stateless and free of side effects
+  //   RESOURCE_EXHAUSTED   — batch above the server's configured size limit
+  //
+  // A batch with zero riders or zero drivers is VALID and returns an empty
+  // assignment, not an error. Empty batches are normal in a quiet window, and
+  // the caller should not need a special case for the common thing.
   rpc SolveBatch(MatchBatchRequest) returns (MatchBatchResponse);
 
   // Lightweight health probe for Kubernetes readiness/liveness.
@@ -73,7 +220,36 @@ service MatchingEngine {
 }
 
 message HealthRequest {}
+
 message HealthResponse {
   bool healthy = 1;
   string version = 2;
+
+  // Road graphs loaded and ready to serve TRAVEL_TIME. Readiness is not merely
+  // "the process is up": a server whose graph is still parsing must not be
+  // sent traffic that needs it, or every such call fails FAILED_PRECONDITION.
+  repeated LoadedGraph loaded_graphs = 3;
 }
+
+message LoadedGraph {
+  string road_graph_id = 1;
+  int32 node_count = 2;
+  int32 arc_count = 3;
+}
+
+// ---- COMPATIBILITY RULES -----------------------------------------------
+//
+// This is a contract between two independently deployed processes, which will
+// never be upgraded at the same instant. Therefore:
+//
+//   - NEVER renumber or reuse a field tag. Removing a field means `reserved`,
+//     not silence: a reused tag makes an old peer's bytes decode as a
+//     DIFFERENT field, which is silent corruption rather than a parse error.
+//     (See the `reserved` entries above, from this revision.)
+//   - Adding an optional field is safe. Adding required BEHAVIOUR is not — old
+//     clients will not send it. New semantics the caller must opt into need a
+//     new field with a safe default, as with max_pairing_cost = 0.
+//   - Adding an enum value is safe only if receivers treat unknown values as
+//     UNSPECIFIED instead of crashing. Both generated stubs do.
+//   - Breaking changes get a new package (matching.v2) served alongside v1.
+//     Never edited in place.
