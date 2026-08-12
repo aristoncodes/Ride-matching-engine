@@ -141,7 +141,7 @@ This is the single source of truth for the 24-week schedule. Each week states it
 - **Bug the test suite caught:** `Shutdown` timed out. `ReadMessage` does **not** return on context cancel — gorilla has no context-aware read — so an idle connection sat in a socket read until its deadline. The fix is a small goroutine per connection that closes the socket when the context ends, which is the only thing that unblocks a blocked reader.
 - **Noted, not built:** outbound server→client push. The write pump exists as a separate goroutine anyway so that when a later week pushes match results to drivers, there is one obvious place for it instead of a race.
 
-#### Week 9 · Sep 3, 2026 · Pipeline Integration — ✅ Complete *(current position — Phase 2 done)*
+#### Week 9 · Sep 3, 2026 · Pipeline Integration — ✅ Complete *(Phase 2 done)*
 
 **Baseline deliverable:** A Go server accepting mock GPS pings every 3 seconds and updating the Redis cache.
 *Intent: wire ingestion → cache into one flowing pipe on the 3-second cadence.*
@@ -162,37 +162,60 @@ This is the single source of truth for the 24-week schedule. Each week states it
 
 **Phase goal:** Build the high-concurrency Go infrastructure to handle B2B traffic spikes.
 
-#### Week 10 · Sep 10, 2026 · Kafka / Redis Streams — ⬜ Not started
-**Baseline deliverable:** An active message queue configured in Go for incoming ride requests.
+#### Week 10 · Sep 10, 2026 · Kafka / Redis Streams — ✅ Complete
+
+**Baseline deliverable:** An active message queue configured in Go for incoming ride requests. → **Redis Streams chosen** ([ADR-0006](adr/0006-redis-streams-over-kafka.md)).
 *Intent: never lose a ride request, even on a crash.*
 
-- **Durable consumption.** Use **consumer groups + explicit acks** so an un-acked message is redelivered after a crash — this is what makes the "retain and retry" tenet real instead of assumed.
-- **Dead-letter path.** Route repeatedly-failing ("poison") messages aside so they don't block the queue.
-- ✅ **Checkpoint:** kill a consumer mid-process and confirm the request is redelivered, not dropped.
+- ✅ **Redis Streams over Kafka, recorded as an ADR.** Redis was already a hard dependency, so a stream is one more key rather than a second stateful system in every environment. Kafka's retention, replay and partition throughput are genuinely stronger and are not exercised by anything here. Accessed through a `queue.Queue` interface, which earns its keep immediately: the Week 12 batcher is testable against an in-memory fake.
+- ✅ **The asymmetry with driver locations is the design.** GPS pings are **state** — only the latest matters, so Week 9 coalesces and sheds them. Ride requests are **events** — every one is a customer on a street corner, so none may be dropped. Getting these backwards is a serious error in either direction.
+- ✅ **Durable consumption.** `XADD` → `XREADGROUP` (NOACK=false) → `XACK`. A claimed-but-unacked message stays in that consumer's Pending Entries List, which is the entire recovery mechanism. **`Reclaim` (XPENDING + XCLAIM) is not an optimisation but the other half of the guarantee** — durability without it just means the request is safely stored and delivered to nobody.
+- ✅ **Dead-letter path.** Two routes in: exceeding `MaxDeliveries` (poison that keeps coming back), and a payload that fails to decode (which will fail identically on every redelivery, so retrying it is how a queue stalls). Dead-lettering acks in the same operation, so a poison message stops occupying a consumer slot.
+- ✅ **Bounded by construction.** `MAXLEN ~` is mandatory, not optional — an untrimmed stream is the same slow-motion OOM as the Week 9 unbounded buffer. `NewRedisStream` refuses a zero `MaxLen`, a missing consumer name, or a zero `MaxDeliveries`.
+- ✅ **Checkpoint met, automated:** `TestUnackedMessageIsRedelivered` — consumer A claims a request and dies without acking; a plain `Consume` from consumer B correctly does *not* see it (">"" returns only never-delivered messages); `Reclaim` recovers it intact with an incremented delivery count. Also asserted: `minIdle` protects a merely-SLOW consumer from having its work stolen, which is the only thing separating "crashed" from "still working".
+- **Bug worth recording:** every consumer after the first failed to start. `isGroupExists` compared `err.Error()[:8]` against `"BUSYGROUP"` — nine characters — so the check never matched. An off-by-one in an error-string test, invisible until a second process existed.
 
-#### Week 11 · Sep 17, 2026 · REST API Standards — ⬜ Not started
+#### Week 11 · Sep 17, 2026 · REST API Standards — ✅ Complete
+
 **Baseline deliverable:** A Ride Request Service built in Go to accept rider requests.
 *Intent: a clean front door for rider requests.*
 
-- **Defensive from day one.** **Input validation, request IDs** (for tracing), and **structured error responses**.
-- **Versioned & documented.** Prefix routes (`/v1/...`) and publish an **OpenAPI** spec so B2B clients can integrate.
-- ✅ **Checkpoint:** a malformed request gets a clear 4xx with a request ID, not a 500.
+- ✅ **One error envelope, everywhere.** `{"error":{"code","message","field","request_id"}}` for every non-2xx, including 404s and 405s that would otherwise be Go's plain text. A B2B client writes its error handling once. `code` is stable and machine-readable; clients branch on it, never on `message`, which gets reworded.
+- ✅ **Validation that names what was expected.** Missing/oversized `rider_id`, missing `pickup`, out-of-range or **non-finite** coordinates, wrong types, **unknown fields** (`DisallowUnknownFields` — a client sending `pickupp` has a bug worth surfacing during integration), trailing JSON, and a 16 KB body cap enforced by `MaxBytesReader` so an oversized body is never fully buffered. `LatLng` uses **pointer fields** so a missing `lat` is distinguishable from a real `0` — (0,0) is a genuine coordinate.
+- ✅ **Request IDs, propagated and sanitised.** An inbound `X-Request-ID` is honoured so a trace spans services, but is length-capped and stripped of anything but `[A-Za-z0-9._-]` — an unbounded client-controlled string flowing into logs and headers is a log/header-injection vector, and there is a test that proves CRLF cannot inject a header.
+- ✅ **Correct status codes.** **202** not 201 (nothing is created; it is queued). **503 + `Retry-After`** not 500 when the queue is unreachable — the request was valid and the fault is ours and transient. Internal error strings never reach the client; the request id is how the log is found.
+- ✅ **Liveness vs readiness are different endpoints and behave differently.** `/healthz` deliberately does **not** check Redis: a liveness probe that fails during a dependency outage gets the container killed, which fixes nothing and removes capacity. `/readyz` does check it, pulling the instance out of the load balancer instead. Asserted by a test that fails the dependency and requires the two to diverge.
+- ✅ **Panic recovery** as a backstop, so even an unforeseen 500 is structured and traceable rather than a dropped connection.
+- ✅ **OpenAPI updated to match the implementation** — the spec previously described a flat `{"error": string}` that the code never produced. A spec that lies is worse than none.
+- ✅ **Checkpoint met:** 14 malformed-input cases, each asserting a 4xx (never a 5xx), a machine-readable code, a request id, and that **nothing invalid reached the queue**.
 
-#### Week 12 · Sep 24, 2026 · Microservice Architecture — ⬜ Not started
+#### Week 12 · Sep 24, 2026 · Microservice Architecture — ✅ Complete
+
 **Baseline deliverable:** A Match Batcher microservice popping requests, aggregating them into 3-second windows, and passing data to the C++ engine.
 *Intent: aggregate requests into the windows the C++ engine wants.*
 
-- **Dual-trigger flush.** Flush on the **3-second timeout OR a max batch size**, whichever comes first — protects both latency (small quiet periods) and memory (sudden spikes).
-- **Per-batch metrics.** Emit size, latency, and match rate for every batch; you'll need these numbers for Phase 6 tuning.
-- ✅ **Checkpoint:** batches form correctly under both light and heavy load, with metrics visible.
+- ✅ **Where every previous week converges:** queue (W10) → driver locations (W7) → C++ engine (W6) → error taxonomy (W6) deciding ack vs requeue vs dead-letter. Runs as its own process (`cmd/batcherd`), horizontally scalable because instances share one consumer group.
+- ✅ **Dual-trigger flush, both halves tested separately.** Timer protects a lone rider in a quiet period from waiting for company that never arrives; size protects against a spike building a batch that blows the solve budget and the memory bound. `FlushReason` is recorded per batch, because consistently size-triggered batches mean the window is too long for the load.
+- ✅ **THE correctness property: a request is acked only after it is matched.** Acking on receipt is simpler and silently drops every in-flight request on a crash. An **unmatched** rider is deliberately **not acked** either — they are still waiting, and leaving the message pending retries them in a later window when more drivers may be on shift. That is the "retain and retry" tenet made concrete.
+- ✅ **Failure handling driven by the Week 6 taxonomy.** Retryable (engine crashed/timed out) → leave the whole batch unacked for redelivery; not retryable (malformed, missing graph, too large) → dead-letter, because retrying is futile and would block the queue forever. Driver-store failure or zero candidates → requeue, since a driver may come on shift within seconds.
+- ✅ **Drivers deduplicated across riders.** A driver near two riders must appear **once**; sending them twice lets the solver believe there are two cars where there is one.
+- ✅ **Per-batch metrics:** size, driver count, matched/unmatched, **match rate**, **queue-wait p50** (the rider-facing latency, p50 rather than mean so one reclaimed request cannot hide the typical experience), solve duration, and total duration. Emitted via a hook so tests are deterministic rather than scraping logs.
+- ✅ **Checkpoint met:** light load flushes on the **timer** (3 riders, 3 matched, rate 1.00); heavy load flushes on **size** before a deliberately-long window can fire. Verified end to end with all four services running: 30 riders / 44 candidate drivers / 17 matched / solve 1 ms, and the 13 unmatched left correctly pending.
+- **Bug found only by running it:** the first batch after every start timed out. `grpc.NewClient` dials lazily, so the first RPC paid TCP + HTTP/2 setup — over a second on a loaded machine, against a `SolveTimeout` of window/2 — while the solve itself takes ~6 ms. Every batcher restart would have lost its first batch to a full reclaim cycle. Fixed by probing `Health` at startup, which both warms the connection and fails fast on a bad address.
 
-#### Week 13 · Oct 1, 2026 · Go Mutexes & Distributed Locking — ⬜ Not started
+#### Week 13 · Oct 1, 2026 · Go Mutexes & Distributed Locking — ✅ Complete *(current position — Phase 3 done)*
+
 **Baseline deliverable:** Distributed locks guaranteeing two riders are never matched to the same driver simultaneously.
 *Intent: guarantee two riders never grab the same driver at once.*
 
-- **Leases, not locks.** Always attach a **TTL** so a crashed lock-holder can't deadlock a driver forever.
-- **Prove it scales.** **Load-test the contention path specifically** — this is a named top risk. Show, with a number, that geohash-partitioned locking reduces contention versus one global lock.
-- ✅ **Checkpoint:** concurrent match attempts on the same driver resolve to exactly one winner, and a crashed holder's lock self-releases.
+- ✅ **Why the solver is not enough.** The C++ engine guarantees no driver is used twice **within one batch** — that is what unit-capacity flow is for. It says nothing about two batchers solving different batches concurrently, both containing the same nearby driver. Each solve is internally correct and the combination dispatches one car to two riders.
+- ✅ **Leases, not locks.** Every acquisition carries a TTL. A lock without one is a deadlock waiting for a crash: the holder dies and that driver is unmatchable forever, with nothing able to distinguish "in use" from "abandoned". `Extend` renews for legitimately long work, so the TTL can stay short instead of being sized for the worst case.
+- ✅ **Atomic acquire.** `SET key token NX PX ttl` in one command. The GET-then-SET version has a race wide enough for two batchers to both observe "free" and both write.
+- ✅ **Fencing tokens, enforced by Lua.** Release and Extend run a script that checks the token before acting, atomically. Without it: holder A stalls, its lease expires, B acquires, A wakes and `DEL`s **B's** lease — the driver double-booked by the very mechanism meant to prevent it. There is a test for exactly that sequence.
+- ✅ **Geohash partitioning, and why geohash specifically.** Contention is **spatial**: two batchers collide precisely when working the same neighbourhood, because that is when their candidate sets overlap. Hashing by driver id would scatter one neighbourhood across every partition and re-serialise everything. A geohash prefix means physical proximity, so a concert letting out contends only with itself.
+- ✅ **Checkpoint met, both halves:** 100 goroutines racing for one driver behind a barrier → **exactly 1 winner, 99 clean `ErrNotAcquired`**. A crashed holder's lease **self-releases** and the driver becomes acquirable again.
+- ✅ **"Prove it scales" — measured, not asserted:** 40 concurrent workers, **one global lock: 3/40 acquired concurrently in 11.0 ms. Geohash-partitioned: 40/40 in 3.1 ms** (spread 0.90). ~13× the concurrency and 3.5× the wall clock, on the named top risk.
+- **Test bug worth recording:** the contention test first reported a spread of 0.28 and failed. The riders were spaced 0.02° (~2.2 km) apart while a precision-5 geohash cell is ~4.9 km, so most "distinct" riders shared a partition. That was the test being unrealistic, not the partitioning being broken — two riders 2 km apart genuinely *are* in one neighbourhood and *should* contend.
 
 ---
 

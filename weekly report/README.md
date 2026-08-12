@@ -15,10 +15,15 @@ Two files per week of the 24-week build:
 | 7 | Redis GEOADD/GEOSEARCH | [week7.md](week7.md) | [learnings7.md](learnings7.md) | ✅ |
 | 8 | WebSockets in Go | [week8.md](week8.md) | [learnings8.md](learnings8.md) | ✅ |
 | 9 | Pipeline integration | [week9.md](week9.md) | [learnings9.md](learnings9.md) | ✅ |
-| 10 | Kafka / Redis Streams | _next_ | _next_ | ⬜ |
+| 10 | Redis Streams (durable queue) | [week10.md](week10.md) | [learnings10.md](learnings10.md) | ✅ |
+| 11 | REST API standards | [week11.md](week11.md) | [learnings11.md](learnings11.md) | ✅ |
+| 12 | Match Batcher microservice | [week12.md](week12.md) | [learnings12.md](learnings12.md) | ✅ |
+| 13 | Distributed locking | [week13.md](week13.md) | [learnings13.md](learnings13.md) | ✅ |
+| 14 | Docker Compose | _next_ | _next_ | ⬜ |
 
-**Phase 1 (C++ core, weeks 1–5): complete.** **Phase 2 (Go bridge & ingestion, weeks 6–9): complete.**
-Phase 3 (message brokering) starts at week 10.
+**Phase 1** (C++ core, weeks 1–5) · **Phase 2** (Go bridge & ingestion, weeks 6–9) ·
+**Phase 3** (message brokering & batching, weeks 10–13) — **all complete.**
+Phase 4 (DevOps & benchmarking) starts at week 14.
 
 For the full 24-week schedule and design rationale, see
 [../docs/Technical_Design_Document.md](../docs/Technical_Design_Document.md).

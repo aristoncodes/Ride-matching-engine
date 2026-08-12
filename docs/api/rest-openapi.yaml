@@ -32,14 +32,20 @@ paths:
               $ref: "#/components/schemas/RideRequestInput"
       responses:
         "202":
-          description: Accepted and enqueued for the next matching window.
+          description: >
+            Accepted and durably enqueued for a later matching window.
+            202 rather than 201 on purpose: nothing has been created yet, and no
+            driver has been assigned. The returned request_id is the idempotency
+            key, and is the same id echoed in X-Request-ID.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/RideRequestAccepted"
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
         "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
 
   /ride-requests/{id}:
     get:
@@ -60,13 +66,32 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
 
-  /health:
+  /healthz:
     get:
-      summary: Liveness/readiness probe
+      summary: Liveness probe
       operationId: health
       security: []
+      description: >
+        Is the process running? Deliberately does NOT check dependencies. A
+        liveness probe that fails during a Redis outage gets the container
+        killed and restarted, which fixes nothing and removes capacity exactly
+        when the system is already degraded.
       responses:
-        "200": { description: OK }
+        "200": { description: The process is alive. }
+
+  /readyz:
+    get:
+      summary: Readiness probe
+      operationId: ready
+      security: []
+      description: >
+        Can this instance do its job? This DOES check the durable queue, because
+        an instance that cannot enqueue cannot accept requests. A failing
+        readiness probe removes the instance from the load balancer without
+        killing it — the correct response to a dependency outage.
+      responses:
+        "200": { description: Ready to accept requests. }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
 
 components:
   securitySchemes:
@@ -114,15 +139,55 @@ components:
         cost: { type: number, format: double }
         eta_seconds: { type: integer, example: 240 }
 
+    # The ONE shape every non-2xx response takes. A client writes its error
+    # handling once, against this. Kept in sync with internal/api/errors.go —
+    # verified by the tests in internal/api/server_test.go, which decode every
+    # error response through this envelope.
     Error:
       type: object
+      required: [error]
       properties:
-        error: { type: string }
-        request_id: { type: string, description: "for tracing/support" }
+        error:
+          type: object
+          required: [code, message, request_id]
+          properties:
+            code:
+              type: string
+              description: >
+                Stable, machine-readable. Branch on THIS, never on `message`
+                (messages get reworded; a client matching on prose breaks
+                silently). Additive only.
+              enum:
+                - invalid_argument
+                - malformed_json
+                - payload_too_large
+                - unauthorized
+                - not_found
+                - method_not_allowed
+                - unavailable
+                - internal
+              example: invalid_argument
+            message:
+              type: string
+              description: Human-readable and actionable; says what was expected.
+              example: "pickup.lat must be between -90 and 90"
+            field:
+              type: string
+              description: The offending input, when exactly one is at fault.
+              example: "pickup.lat"
+            request_id:
+              type: string
+              description: >
+                Tracing key, also returned in the X-Request-ID header on every
+                response. Quote it in any support request.
+              example: "req_9f2c4a1b8e7d6c5f4a3b2c1d"
 
   responses:
     BadRequest:
-      description: Malformed request.
+      description: >
+        Malformed or invalid request. Always a 4xx with a structured body and a
+        request id — never a 500. Covers: unparseable JSON, unknown fields,
+        wrong types, missing required fields, and out-of-range coordinates.
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     Unauthorized:
       description: Missing or invalid API key.
@@ -132,4 +197,16 @@ components:
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     RateLimited:
       description: Per-key rate limit exceeded.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    PayloadTooLarge:
+      description: Request body exceeded the server limit (16 KiB).
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    ServiceUnavailable:
+      description: >
+        The request was valid but could not be accepted — typically the durable
+        queue is unreachable. Transient and safe to retry; see Retry-After.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Seconds to wait before retrying.
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }

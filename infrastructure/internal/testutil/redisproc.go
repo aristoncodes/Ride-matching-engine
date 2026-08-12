@@ -1,11 +1,14 @@
 package testutil
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // RedisProcess is a redis-server started just for one test.
@@ -103,4 +106,18 @@ func WaitForFile(path string, timeout time.Duration) bool {
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// RedisCmd runs a raw Redis command against addr. Used by tests that need to
+// write malformed data directly, bypassing the production code's validation —
+// there is otherwise no way to exercise the "what if the stream contains
+// garbage" path, because the writer refuses to create it.
+func RedisCmd(ctx context.Context, addr string, args ...interface{}) error {
+	network := "tcp"
+	if len(addr) > 0 && addr[0] == '/' {
+		network = "unix"
+	}
+	client := redis.NewClient(&redis.Options{Network: network, Addr: addr})
+	defer client.Close()
+	return client.Do(ctx, args...).Err()
 }
