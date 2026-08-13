@@ -29,6 +29,7 @@ import (
 	"github.com/aditya/ride-matching/internal/batcher"
 	"github.com/aditya/ride-matching/internal/engine"
 	"github.com/aditya/ride-matching/internal/locations"
+	"github.com/aditya/ride-matching/internal/metrics"
 	"github.com/aditya/ride-matching/internal/queue"
 )
 
@@ -69,6 +70,11 @@ func main() {
 		ServiceName: "batcherd",
 		Logger:      logger,
 	})
+	// /metrics on the ADMIN port, not the public one. A metrics endpoint
+	// enumerates your internals — route names, tenant ids, error rates — which
+	// is exactly the reconnaissance an attacker wants, and it is also a free
+	// scrape-amplification target. Prometheus scrapes inside the cluster.
+	admin.Handle("GET /metrics", metrics.Handler(metrics.Registry()))
 	admin.Start()
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -204,6 +210,7 @@ func main() {
 	cfg.RoadGraphID = *graphID
 	cfg.SolveTimeout = *window / 2
 	cfg.Logger = logger
+	cfg.TenantLabel = *tenant
 
 	b, err := batcher.New(q, drivers, eng, cfg)
 	if err != nil {

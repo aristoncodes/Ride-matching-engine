@@ -19,12 +19,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"sync/atomic"
 	"time"
 
 	matchingv1 "github.com/aditya/ride-matching/gen/matching/v1"
 	"github.com/aditya/ride-matching/internal/engine"
 	"github.com/aditya/ride-matching/internal/locations"
+	"github.com/aditya/ride-matching/internal/metrics"
 	"github.com/aditya/ride-matching/internal/queue"
 )
 
@@ -77,6 +79,11 @@ type Config struct {
 	MaxMatchAttempts int
 
 	Logger *slog.Logger
+
+	// TenantLabel is the value used for the `tenant` Prometheus label.
+	// Separate from the routing tenant so a single-tenant deployment can still
+	// emit a meaningful label without inventing one at every call site.
+	TenantLabel string
 
 	// OnBatch receives per-batch metrics. Week 20-22's tuning needs these
 	// numbers, and a hook keeps tests deterministic instead of scraping logs.
@@ -561,6 +568,31 @@ func (b *Batcher) emit(m BatchMetrics, started time.Time) {
 		"queue_wait_p50_ms", m.QueueWaitP50.Milliseconds(),
 		"solve_ms", m.SolveDuration.Milliseconds(),
 		"total_ms", m.TotalDuration.Milliseconds())
+
+	// Prometheus. Tenant is a BOUNDED label (tens of B2B customers); nothing
+	// here is labelled by rider or driver id, which would be unbounded.
+	tenant := b.cfg.TenantLabel
+	if tenant == "" {
+		tenant = "default"
+	}
+	metrics.BatchesTotal.WithLabelValues(tenant, string(m.Reason)).Inc()
+	metrics.BatchSize.WithLabelValues(tenant).Observe(float64(m.Riders))
+	metrics.SolveSeconds.WithLabelValues(tenant, b.cfg.CostMetric.String()).
+		Observe(m.SolveDuration.Seconds())
+	metrics.RidersTotal.WithLabelValues(tenant, "matched").Add(float64(m.Matched))
+	metrics.RidersTotal.WithLabelValues(tenant, "requeued").Add(float64(m.Requeued))
+	metrics.RidersTotal.WithLabelValues(tenant, "exhausted").Add(float64(m.Exhausted))
+	metrics.RidersTotal.WithLabelValues(tenant, "dead_lettered").Add(float64(m.DeadLettered))
+	if m.QueueWaitP50 > 0 {
+		// The rider-facing number: accepted -> matched, which the batch window
+		// dominates. NOT the solve time, which is three orders of magnitude
+		// smaller and is not what anyone waits for.
+		metrics.MatchLatencySeconds.WithLabelValues(tenant).Observe(m.QueueWaitP50.Seconds())
+	}
+	if m.Err != nil {
+		metrics.DependencyErrorsTotal.WithLabelValues("engine",
+			strconv.FormatBool(engine.Retryable(m.Err))).Inc()
+	}
 
 	if b.cfg.OnBatch != nil {
 		b.cfg.OnBatch(m)

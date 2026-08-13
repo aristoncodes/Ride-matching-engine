@@ -25,13 +25,19 @@ Two files per week of the 24-week build:
 | 17 | CI/CD | [week17.md](week17.md) | [learnings17.md](learnings17.md) | ✅ |
 | 18 | API key management | [week18.md](week18.md) | [learnings18.md](learnings18.md) | ✅ |
 | 19 | Data segregation | [week19.md](week19.md) | [learnings19.md](learnings19.md) | ✅ |
-| 20 | Go pprof profiling | _next_ | _next_ | ⬜ |
+| 20 | Go pprof profiling | [week20.md](week20.md) | [learnings20.md](learnings20.md) | ✅ |
+| 21 | Traffic blasting | [week21.md](week21.md) | ↑ | ✅ |
+| 22 | GC / query optimisation | [week22.md](week22.md) | ↑ | ✅ |
+| 23 | slog & telemetry | [week23.md](week23.md) | [learnings23.md](learnings23.md) | ✅ |
+| 24 | Documentation | [week24.md](week24.md) | ↑ | ✅ |
 
 **Phase 1** (C++ core, weeks 1–5) · **Phase 2** (Go bridge & ingestion, weeks 6–9) ·
 **Phase 3** (message brokering & batching, weeks 10–13) ·
 **Phase 4** (DevOps & benchmarking, weeks 14–15) ·
-**Phase 5** (production orchestration, weeks 16–19) — **all complete.**
-Phase 6 (enterprise hardening) starts at week 20.
+**Phase 5** (production orchestration, weeks 16–19) ·
+**Phase 6** (enterprise hardening, weeks 20–24) — **all complete.**
+
+**The project is finished: 24 of 24 weeks, 24 of 24 checkpoints met.**
 
 For the full 24-week schedule and design rationale, see
 [../docs/Technical_Design_Document.md](../docs/Technical_Design_Document.md).

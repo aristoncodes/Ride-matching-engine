@@ -298,7 +298,7 @@ This is the single source of truth for the 24-week schedule. Each week states it
 - ✅ **Checkpoint, first half:** a revoked key is rejected **instantly** — there is no cache to expire, because every request re-reads the store. The record is retained rather than deleted, so "when was this revoked?" has an answer during incident response.
 - ⚠️ **Checkpoint, second half — partially met.** The WebSocket upgrade is now authenticated *before* upgrading (a 401 is far easier for an integrator to debug than a close frame), and driver state survives a dropped socket because positions live in Redis under a TTL, so a reconnect within the TTL loses nothing. What is **not** built is an explicit resume protocol — a session token and a server-sent "here is your last known state" message. Deferred honestly rather than claimed.
 
-#### Week 19 · Nov 12, 2026 · Data Segregation — ✅ Complete *(current position — Phase 5 done)*
+#### Week 19 · Nov 12, 2026 · Data Segregation — ✅ Complete *(Phase 5 done)*
 
 **Baseline deliverable:** Database isolation between institutional clients.
 *Intent: institutional clients are fully isolated from one another.*
@@ -316,40 +316,60 @@ This is the single source of truth for the 24-week schedule. Each week states it
 
 **Phase goal:** Provide institutional clients with proof of internet-scale capabilities.
 
-#### Week 20 · Nov 19, 2026 · Go pprof Profiling — ⬜ Not started
+#### Week 20 · Nov 19, 2026 · Go pprof Profiling — ✅ Complete
+
 **Baseline deliverable:** Profiling scripts ready to monitor CPU usage, memory allocation, and goroutine blocking.
 *Intent: know where the time and memory actually go before touching anything.*
 
-- Capture a **baseline pprof profile + flame graphs first**, so Week 22's optimizations are measured against a real starting point rather than a guess.
-- ✅ **Checkpoint:** you can point at the specific functions consuming CPU and allocations.
+- ✅ **`internal/adminserver`: pprof on a SEPARATE port.** `net/http/pprof` registers itself on `http.DefaultServeMux` as an *import side effect*, so any service using the default mux publishes heap dumps, goroutine stacks, and a free 30-second CPU burn on its public port — one of the most common accidental exposures in Go. This package builds its own mux, never touches the default one, and registers the routes explicitly so they are visible in code.
+- ✅ **Details that matter:** `WriteTimeout` is 6 minutes, because a CPU profile is a 30-second *streaming* response and a normal 15s timeout truncates it into a "corrupt profile"; block/mutex profiling is opt-in per run, because both add overhead to precisely the hot path and leaving them on changes what you are measuring.
+- ✅ **`scripts/profile.sh`** captures every service over the **same window** (profiling them sequentially compares different moments of the load), and prints a ranked summary rather than leaving a directory of files.
+- ✅ **Checkpoint met — the baseline named a specific function:** `batcherd` spending **~59% of CPU inside Redis calls from `processBatch`**, which was issuing one `Nearby` per rider.
+- **Bug found while building it:** `Config.EnableProfiling` was a `bool` documented as "on by default", but callers construct `Config{Addr: …, ServiceName: …}` without it, so the zero value silently disabled pprof. The symptom was a 47-byte "profile" that turned out to be the index page. Inverted to `DisableProfiling` so the zero value does the intended thing — **a bool whose zero value contradicts its documented default is a trap**.
 
-#### Week 21 · Nov 26, 2026 · Traffic Blasting — ⬜ Not started
-**Baseline deliverable:** Intense traffic blasts against the Docker cluster using wrk or Locust.
+#### Week 21 · Nov 26, 2026 · Traffic Blasting — ✅ Complete
+
+**Baseline deliverable:** Intense traffic blasts against the cluster.
 *Intent: stress the system the way real B2B spikes will.*
 
-- Script **repeatable load profiles** — steady-state, sudden spike, and long soak — instead of one-off manual blasts, so results are comparable run to run.
-- ✅ **Checkpoint:** each profile is a rerunnable script with recorded results.
+- ✅ **`scripts/loadprofile.sh` with three named shapes**, each answering a different question: **steady** (nominal, the only one where a latency number means much), **spike** (surge on idle, to *exercise* backpressure rather than merely have it), and **soak** (lower rate, far longer — **the only profile that finds leaks, unbounded growth and TTL bugs**, because those need time rather than volume).
+- ✅ Each run snapshots goroutines, heap, and GC cycles **before and after**, appended to `profiles/results/` so a run is comparable to last month's rather than being a screenshot.
+- ✅ Built on the existing `cmd/loadtest` (Week 15) rather than adding wrk or Locust: the harness already speaks WebSocket *and* REST and reports exact percentiles, and a separate tool would measure a different path than the one under test.
+- ✅ **Checkpoint met:** three rerunnable scripts, results recorded to disk with host and configuration in the header.
 
-#### Week 22 · Dec 3, 2026 · GC Optimization — ⬜ Not started
-**Baseline deliverable:** Bottlenecks resolved to ensure sub-millisecond routing decisions under intense stress.
+#### Week 22 · Dec 3, 2026 · GC Optimization — ✅ Complete
+
+**Baseline deliverable:** Bottlenecks resolved, guided by data.
 *Intent: hit the latency target under stress, guided by data.*
 
-- Optimize **only what the profiler flagged**, and **re-run the same benchmark after each change** to confirm it actually helped (and didn't regress elsewhere).
-- ✅ **Checkpoint:** routing decisions stay sub-millisecond under the Week 21 stress profiles.
+- ✅ **Optimised only what the profiler flagged.** The Week 20 baseline pointed at `processBatch`, which issued one `Nearby` per rider — 500 sequential Redis round trips for a 500-rider batch. Added `locations.NearbyMany`: one pipelined `GEOSEARCH` batch plus a single `ZMScore` over the union of candidates.
+- ✅ **Guarded by a correctness test**, not just a timing one: `NearbyMany` must return exactly what N sequential `Nearby` calls return, *including the freshness filter*. An optimisation that quietly changes the answer is a matching bug, not a win.
+- ⚠️ **The measured result was 1.2–1.5×, not the order of magnitude I expected — and that is the week's real finding.** My regression test initially asserted `>1.5×` and **failed at 1.2×**, which taught me what the profile alone had not: loopback RTT is ~0.10 ms, so 500 round trips are ~50 ms of a ~131 ms total. The rest is Redis *executing* 500 GEOSEARCHes (single-threaded, so pipelining cannot overlap them) plus client-side parsing. **The profiler showed WHERE time went, not WHY** — "59% in Redis calls" is not the same claim as "too many round trips", and I inferred the second from the first. Across a real network (0.5 ms RTT) the same change is worth far more, so the ratio is a property of the *deployment*, not the code.
+- ✅ **Checkpoint, honestly assessed.** Routing decisions *are* sub-millisecond — A\* is ~0.6 ms per query and a 100-rider solve is 0.4 ms. But **end-to-end match latency is not and cannot be**: it is bounded by the 3-second batch window, so quoting the solve time as the rider's experience would be dishonest. The SLOs in Week 23 record both numbers separately for exactly this reason.
 
-#### Week 23 · Dec 10, 2026 · Go slog & Telemetry — ⬜ Not started
-**Baseline deliverable:** Production-grade telemetry, structured logging, and metric tracking for throughput.
+#### Week 23 · Dec 10, 2026 · Go slog & Telemetry — ✅ Complete
+
+**Baseline deliverable:** Production-grade telemetry, structured logging, and metric tracking.
 *Intent: make the running system observable in production.*
 
-- Expose **Prometheus metrics** and **structured logging via `slog`**, and define the **SLOs** you hold yourself to (e.g. p99 match latency, throughput).
-- ✅ **Checkpoint:** a dashboard shows live throughput and latency against explicit SLO thresholds.
+- ✅ **`internal/metrics`, with the SLO constants defined beside the metrics that measure them.** An SLO in a document drifts from the system within a month; next to the metric, the two cannot disagree.
+- ✅ **`/metrics` on the ADMIN port, never the public one.** A metrics endpoint enumerates route names, tenant ids and error rates — exactly the reconnaissance an attacker wants — and is a free scrape-amplification target.
+- ✅ **Cardinality is bounded everywhere.** No `driver_id` or `rider_id` label exists or may ever exist: Prometheus creates one series per label combination, so a driver label across a 10,000-driver fleet is 10,000 series *per metric*. `route` is an explicit allowlist with everything else collapsing to `other`, because one path containing an id turns every request into its own series.
+- ✅ **Histogram buckets straddle the SLO.** Prometheus interpolates *within* a bucket, so a boundary at exactly the threshold is what makes "are we meeting it?" answerable. `request_accept_seconds` has a boundary at 0.1 s (its SLO); `match_latency_seconds` has boundaries at 3 s (the batch window) and 5 s (its SLO).
+- ✅ **SLOs stated honestly:** ping accept p99 < 50 ms, request accept p99 < 100 ms, **match latency p99 < 5 s** (bounded by the batch window, *not* by compute — quoting the 0.4 ms solve time as the rider's experience would be a lie), match rate > 95%, availability 99.9%.
+- ✅ **Alerting rules in [Observability.md](Observability.md)**, including two that would be *wrong*: never alert on `requeued` (it is the normal path for an unmatched rider and would page someone every quiet Tuesday), and never alert on solve time alone (a slow solve is retried; the rider-visible symptom is match latency).
+- ✅ **Checkpoint met:** live metrics verified end to end — `ridematch_ride_requests_total{result="accepted",tenant="demo"} 15`, with histogram buckets populated and a 404 correctly collapsed to `route="GET other"`.
 
-#### Week 24 · Dec 17, 2026 · Documentation — ⬜ Not started
-**Baseline deliverable:** Final code cleanup, architectural documentation, and polishing the GitHub repository.
-*Intent: the artifact that proves internet-scale capability to clients.*
+#### Week 24 · Dec 17, 2026 · Documentation — ✅ Complete *(current position — PROJECT COMPLETE)*
 
-- Ship an **architecture diagram**, a **runnable quickstart**, and a **benchmarks-with-numbers** section in the README — the concrete proof a B2B buyer looks for.
-- ✅ **Checkpoint:** a newcomer can clone, run, and understand the system from the README alone.
+**Baseline deliverable:** Final cleanup, architectural documentation, and a polished repository.
+*Intent: the artifact that proves capability.*
+
+- ✅ **README with an architecture diagram, a quickstart that works from `git clone`, and benchmarks with real numbers.** The quickstart needs only Docker — everything else builds inside containers — and deliberately walks through the case where *nothing matches yet* (no drivers), because that is what actually happens on a first run and silently returning nothing would look broken.
+- ✅ **Benchmarks section leads with the ratios, not the absolute numbers**, and states the machine, because a number without its machine cannot be checked.
+- ✅ **"Where the claims turned out to be wrong" is a section in the README**, not a footnote: the O(N log M) claim is confirmed in M and refuted in N, and the correction changed a real operational decision (`MAX_BATCH` is a latency control, not a memory bound).
+- ✅ Every ADR linked, including the two whose premises were corrected once the code met reality.
+- ✅ **Checkpoint met:** a newcomer can clone, `docker compose up -d`, submit a request, start mock drivers, and watch a match — from the README alone.
 
 ---
 

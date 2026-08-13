@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/aditya/ride-matching/internal/auth"
+	"github.com/aditya/ride-matching/internal/metrics"
 	"github.com/aditya/ride-matching/internal/queue"
 )
 
@@ -265,6 +266,10 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
 
+		// Route, not raw path: a path label would create one series per
+		// request id and blow up cardinality.
+		metrics.HTTPRequestsTotal.WithLabelValues(routeLabel(r), metrics.StatusClass(rec.status)).Inc()
+
 		s.cfg.Logger.Info("http request",
 			"method", r.Method,
 			"path", r.URL.Path,
@@ -311,6 +316,7 @@ func (s *Server) recoverPanics(next http.Handler) http.Handler {
 // ---- Handlers ----------------------------------------------------------
 
 func (s *Server) handleCreateRideRequest(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	requestID := RequestIDFrom(r.Context())
 
 	// Bound the body BEFORE decoding. MaxBytesReader makes the decoder itself
@@ -390,6 +396,8 @@ func (s *Server) handleCreateRideRequest(w http.ResponseWriter, r *http.Request)
 	// will be matched in a later window, and claiming otherwise would be a lie
 	// the client might act on.
 	s.accepted.Add(1)
+	metrics.RideRequestsTotal.WithLabelValues(tenantID, "accepted").Inc()
+	metrics.RequestAcceptSeconds.WithLabelValues(tenantID).Observe(time.Since(started).Seconds())
 	writeJSON(w, http.StatusAccepted, requestID, rideRequestAccepted{
 		RequestID: requestID,
 		Status:    "PENDING",
@@ -520,4 +528,18 @@ func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 	requestID := RequestIDFrom(r.Context())
 	writeError(w, http.StatusNotFound, CodeNotFound,
 		fmt.Sprintf("no route for %s %s", r.Method, r.URL.Path), "", requestID)
+}
+
+// routeLabel maps a request to a BOUNDED label.
+//
+// Using r.URL.Path directly would be a cardinality bomb the moment a path
+// contains an id: every distinct URL becomes its own Prometheus time series,
+// and a monitoring system dies of that long before it helps you.
+func routeLabel(r *http.Request) string {
+	switch r.URL.Path {
+	case "/v1/ride-requests", "/healthz", "/readyz", "/stats":
+		return r.Method + " " + r.URL.Path
+	default:
+		return r.Method + " other"
+	}
 }

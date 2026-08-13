@@ -25,6 +25,7 @@ import (
 
 	"github.com/aditya/ride-matching/internal/adminserver"
 	"github.com/aditya/ride-matching/internal/api"
+	"github.com/aditya/ride-matching/internal/metrics"
 	"github.com/aditya/ride-matching/internal/queue"
 )
 
@@ -58,6 +59,11 @@ func main() {
 		ServiceName: "requestd",
 		Logger:      logger,
 	})
+	// /metrics on the ADMIN port, not the public one. A metrics endpoint
+	// enumerates your internals — route names, tenant ids, error rates — which
+	// is exactly the reconnaissance an attacker wants, and it is also a free
+	// scrape-amplification target. Prometheus scrapes inside the cluster.
+	admin.Handle("GET /metrics", metrics.Handler(metrics.Registry()))
 	admin.Start()
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
