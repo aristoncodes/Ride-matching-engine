@@ -371,6 +371,13 @@ This is the single source of truth for the 24-week schedule. Each week states it
 - ✅ Every ADR linked, including the two whose premises were corrected once the code met reality.
 - ✅ **Checkpoint met:** a newcomer can clone, `docker compose up -d`, submit a request, start mock drivers, and watch a match — from the README alone.
 
+**Bug found by CI on the final commit — a graceful-shutdown race in `ingest`.** The last push went green locally and red on GitHub. `Server.Handler` checked the shutdown channel, incremented `activeConns`, authenticated, upgraded, and only *then* called `wg.Add`. A request anywhere in that window when `Shutdown` ran caused two failures: `wg.Wait` saw a zero counter and returned — so `Shutdown` reported a clean exit with a request still in flight, leaving `activeConns` at 1 — and the `Add` racing that `Wait` is a `sync.WaitGroup` contract violation the race detector flags outright.
+
+The fix takes the wait-group token at the *top* of the handler, under the same mutex `Shutdown` uses to stop admitting. Two lessons worth more than the fix:
+
+- **A time-window bug cannot be reproduced by re-running the test.** Twenty runs at `GOMAXPROCS=1` and a dialer hammering the server through a shutdown both passed on this laptop. What worked was making the window *deliberate*: a stub `auth.Store` whose `Lookup` blocks parks a request exactly inside it, and the old code then fails **every** time with the same `active = 1` CI reported. Authentication is genuinely the widest part of that window in production, because it talks to Redis — so the test is a real scenario, not a contrived one.
+- **A green local run is weaker evidence than a green CI run**, and the difference is not thoroughness — it is that CI's slower, 2-core, differently-scheduled machine samples interleavings a fast laptop never visits. This is the case for keeping the race detector on in CI even when it costs minutes.
+
 ---
 
 ### Cross-Cutting Principles (apply every single week)

@@ -114,3 +114,76 @@ write down surfaces immediately.
 5. Give an example of an alert that would fire on perfectly healthy behaviour.
 6. Why put SLO constants in the code rather than a document?
 7. Why does a README benefit from a section about what you got wrong?
+
+---
+
+## Postscript: the bug CI found on the very last commit
+
+The final push was green locally and **red on GitHub**. Worth writing down,
+because it is the most interview-relevant bug in the project.
+
+`ingest.Server.Handler` checked the shutdown channel, incremented `activeConns`,
+authenticated, upgraded, and only *then* called `wg.Add(1)`. `Shutdown` closed
+the channel and called `wg.Wait()`. A request sitting anywhere in that window
+when `Shutdown` ran caused two distinct failures:
+
+1. **`Wait` saw a zero counter and returned** — `Shutdown` reported a clean exit
+   while a request was still being served, and `activeConns` was 1 afterwards.
+2. **`sync.WaitGroup` forbids an `Add` that raises the counter from zero while a
+   `Wait` is in flight.** That is a documented contract violation, and the race
+   detector reports it as a data race.
+
+**The fix:** take the token at the *top* of the handler, under the same mutex
+`Shutdown` uses to stop admitting.
+
+```go
+func (s *Server) admit() bool {
+    s.admitMu.Lock(); defer s.admitMu.Unlock()
+    if s.closed { return false }
+    s.wg.Add(1)
+    return true
+}
+```
+
+A later `wg.Add` for the connection goroutine needs no lock: the handler's own
+token keeps the counter above zero, so no `Wait` can be mid-return.
+
+### Lesson 1: you cannot reproduce a window bug by re-running the test
+
+Twenty runs at `GOMAXPROCS=1`, and a test with eight goroutines dialling
+continuously through a shutdown — **both passed on the old code.** Re-running is
+sampling a distribution, and this window is a few instructions wide.
+
+What worked was making the window **deliberate**: a stub `auth.Store` whose
+`Lookup` blocks on a channel parks a request exactly inside it. The old code
+then fails *every single time* with the same `active = 1` CI reported.
+
+And it is not a contrived scenario — authentication is genuinely the widest part
+of that window in production, because it talks to Redis.
+
+> **Reproduce a race by controlling the schedule, not by re-rolling the dice.**
+> If your repro is "run it 50 times", you do not have a repro.
+
+### Lesson 2: a green local run is weaker evidence than a green CI run
+
+Not because CI is more thorough — the command is identical. Because CI is a
+slower, 2-core, differently-scheduled machine, and it samples interleavings this
+laptop never visits. That is the whole argument for paying for `-race` in CI.
+
+### Lesson 3: "graceful shutdown" has a precise meaning
+
+It is not "stop accepting and exit." It is: **when `Shutdown` returns, nothing is
+still running.** The check `activeConns == 0` *after* `Shutdown` returned is what
+turns that from a wish into an assertion — and it is exactly the line that
+failed.
+
+The general shape, worth recognising anywhere:
+
+> **The check and the registration must be one atomic step against the
+> shutdown.** Checking a flag and then registering is a TOCTOU bug whatever the
+> registration is — a WaitGroup, a map entry, a connection count.
+
+## Self-test (continued)
+8. Why is `Add` concurrent with `Wait` a bug even when the counter looks fine?
+9. Your test passes 20 times on the buggy code. Is the bug gone? How do you prove it?
+10. What exactly does "graceful shutdown" promise, and what asserts it?

@@ -168,6 +168,33 @@ type Server struct {
 	shutdown  chan struct{}
 	closeOnce sync.Once
 	wg        sync.WaitGroup
+
+	// admitMu makes "are we still accepting?" and "register this connection"
+	// a single atomic step against Shutdown's "stop accepting, then wait".
+	//
+	// Checking a channel and then calling wg.Add is NOT enough: sync.WaitGroup
+	// forbids an Add that raises the counter from zero while a Wait is already
+	// in flight, and that is exactly the interleaving a request arriving during
+	// shutdown produces. The race detector on CI caught it; a fast laptop did
+	// not. See Week 24 in the TDD.
+	admitMu sync.Mutex
+	closed  bool
+}
+
+// admit reserves a place in the wait group, or reports that the server has
+// begun shutting down.
+//
+// The caller owns the returned token until it calls wg.Done. Any FURTHER
+// wg.Add made while holding it is safe without the lock, because the counter
+// cannot be zero and so no Wait can be mid-return.
+func (s *Server) admit() bool {
+	s.admitMu.Lock()
+	defer s.admitMu.Unlock()
+	if s.closed {
+		return false
+	}
+	s.wg.Add(1)
+	return true
 }
 
 // NewServer creates a server. It does not listen; mount Handler() on a mux.
@@ -205,12 +232,16 @@ func (s *Server) Stats() Stats {
 // Handler upgrades HTTP requests to WebSocket connections.
 func (s *Server) Handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case <-s.shutdown:
+		// Hold a wait-group token for the whole handler, not just for the
+		// connection goroutine. Shutdown must not be able to return while a
+		// request is still between the admission check and the upgrade —
+		// that window is how activeConns ends up non-zero after a "clean"
+		// shutdown.
+		if !s.admit() {
 			http.Error(w, "server shutting down", http.StatusServiceUnavailable)
 			return
-		default:
 		}
+		defer s.wg.Done()
 
 		// Reserve a slot BEFORE upgrading. Checking after the upgrade means the
 		// connection is already established and must then be torn down, which
@@ -266,6 +297,8 @@ func (s *Server) Handler() http.HandlerFunc {
 		}
 
 		s.totalConns.Add(1)
+		// Safe without admitMu: this handler's own token keeps the counter
+		// above zero, so no Wait can complete between here and serve starting.
 		s.wg.Add(1)
 		go s.serve(conn, tenantID)
 	}
@@ -447,7 +480,13 @@ func validate(p Ping) error {
 // report "shut down" while goroutines were still running and still writing to
 // Redis — which is how a process that "exited cleanly" corrupts its last batch.
 func (s *Server) Shutdown(ctx context.Context) error {
+	// Stop admitting under the same lock admit() takes, so that once Wait
+	// begins, no new token can be created. Ordering matters: flip the flag
+	// BEFORE waiting, never after.
+	s.admitMu.Lock()
+	s.closed = true
 	s.closeOnce.Do(func() { close(s.shutdown) })
+	s.admitMu.Unlock()
 
 	done := make(chan struct{})
 	go func() {
