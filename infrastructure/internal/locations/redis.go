@@ -327,9 +327,13 @@ func (r *RedisRepository) Reap(ctx context.Context) (int, error) {
 	var stale []string
 	err := r.withRetry(ctx, func() error {
 		var innerErr error
-		stale, innerErr = r.client.ZRangeByScore(ctx, r.seenKey(), &redis.ZRangeBy{
-			Min: "-inf",
-			Max: fmt.Sprintf("(%d", cutoff), // exclusive: equal to the cutoff is still fresh
+		// ZRangeArgs rather than the deprecated ZRangeByScore (SA1019). Same
+		// query, current API.
+		stale, innerErr = r.client.ZRangeArgs(ctx, redis.ZRangeArgs{
+			Key:     r.seenKey(),
+			ByScore: true,
+			Start:   "-inf",
+			Stop:    fmt.Sprintf("(%d", cutoff), // exclusive: equal to the cutoff is still fresh
 			// Bounded per sweep. An unbounded reap after an outage could pull
 			// millions of ids into one command and stall Redis, which is
 			// single-threaded — the reaper would cause the outage it exists to

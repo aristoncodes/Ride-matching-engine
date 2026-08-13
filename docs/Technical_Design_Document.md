@@ -236,7 +236,7 @@ This is the single source of truth for the 24-week schedule. Each week states it
 - ✅ **Checkpoint met:** `docker compose up` brought all five services to `healthy` in **12–13 s across three consecutive cold cycles** (`down -v` between each), and the full flow was verified through the containers — 50 drivers over WebSockets, 25 riders over REST, 14 matched, 0 solve errors.
 - **Bug found by containerising:** the batcher's startup engine-probe timed out. `Client.Health` caps at the client's 2 s default, and a *first* gRPC connection inside Docker (DNS + TCP + HTTP/2) exceeds it — so the Week 12 cold-start fix silently stopped working in the environment it mattered most. Fixed with a longer client timeout plus retry; the probe now succeeds on attempt 1.
 
-#### Week 15 · Oct 15, 2026 · Load Testing Basics — ✅ Complete *(current position — Phase 4 done)*
+#### Week 15 · Oct 15, 2026 · Load Testing Basics — ✅ Complete *(Phase 4 done)*
 
 **Baseline deliverable:** A Go script simulating 10,000 concurrent drivers, proving latency is near O(N log M).
 *Intent: turn the performance goals into measured evidence.*
@@ -256,37 +256,59 @@ This is the single source of truth for the 24-week schedule. Each week states it
 
 **Phase goal:** Ensure B2B reliability, multi-tenancy, and edge-case handling.
 
-#### Week 16 · Oct 22, 2026 · Kubernetes (K8s) Basics — ⬜ Not started
+#### Week 16 · Oct 22, 2026 · Kubernetes (K8s) Basics — ✅ Complete
+
 **Baseline deliverable:** Microservices wrapped and managed by Kubernetes to stay online during crashes.
 *Intent: the system heals itself when parts die.*
 
-- **Health & scaling.** Define **liveness/readiness probes**, **resource requests/limits**, and an **HPA** for the stateless Go services.
-- **Prove resiliency.** Kill the C++ pod under active load and demonstrate **zero dropped ride requests** — this validates the project's core resiliency goal, not just that YAML applies cleanly.
-- ✅ **Checkpoint:** a chaos test (delete a pod mid-traffic) shows automatic recovery with no lost requests.
+- ✅ **A real cluster** (`k8s/`): kind with a control-plane and **two workers**, so pods have somewhere to be rescheduled and anti-affinity is meaningful rather than silently unsatisfiable. The node image digest was read out of the kind binary rather than written from memory — an invented digest fails with a confusing registry "not found".
+- ✅ **Redis as a StatefulSet, not a Deployment.** It holds the durable queue, and a Deployment treats storage as interchangeable; a rescheduled Redis coming back with an empty volume would lose every un-acked ride request. Honest limitation recorded: one replica is a single point of failure, mitigated by AOF, which is exactly why the chaos test kills the *engine*.
+- ✅ **Probes that mean different things.** A **startup probe separate from liveness** on the engine, because it parses an OSM extract before listening: without the split you must set a large `initialDelaySeconds` on liveness, which then delays detection of a real hang by the same amount. `/healthz` for Go liveness (deliberately does NOT check Redis — a liveness probe failing during a dependency outage restarts the whole fleet and fixes nothing); `/readyz` for `requestd` readiness, which does.
+- ✅ **Resource requests and limits** on every container, with the memory limit set *above* Redis's `maxmemory` so an AOF rewrite's copy-on-write does not trip the OOM killer.
+- ✅ **HPA on `requestd` and `ingestd`** with metrics-server, reporting real utilisation. **`batcherd` deliberately has none:** it blocks on `XREADGROUP`, so it looks idle exactly when the queue is backing up, and CPU-based autoscaling would scale it *down* under load. Queue-depth scaling needs KEDA and is deferred rather than faked with a metric that would actively mislead.
+- ✅ **Checkpoint met** (`k8s/chaos-test.sh`): **both** engine pods deleted mid-traffic → 200 accepted, **200 distinct in the queue, 0 pending, 0 undelivered, 0 dead-lettered**. 125 requests needed more than one window — retried, not lost.
+- 🐞 **The chaos test found a real data-loss bug.** Week 10 counts *deliveries* to detect poison; Week 12 leaves an unmatched rider *un-acked* so a later window retries. Both look identical to a broker, so a rider who simply could not find a car accumulated deliveries until the poison detector dead-lettered them — observed live at **delivery count 4 of 5**. Fixed by separating `Message.Deliveries` (infrastructure) from `Request.MatchAttempts` (product outcome), with `Queue.Republish` resetting the former and advancing the latter. Two regression tests pin it. **No unit test could have found this; it needed a real cluster under sustained load.**
 
-#### Week 17 · Oct 29, 2026 · CI/CD — ⬜ Not started
-**Baseline deliverable:** Automated testing and deployment pipelines configured (GitHub Actions / Jenkins).
+#### Week 17 · Oct 29, 2026 · CI/CD — ✅ Complete
+
+**Baseline deliverable:** Automated testing and deployment pipelines configured (GitHub Actions).
 *Intent: every merge is automatically proven safe.*
 
-- **Quality gates.** Block merges unless **build + unit tests + sanitizers + lint** all pass.
-- **Release automation.** Build and push **versioned images on tag**.
-- ✅ **Checkpoint:** a red test blocks the merge; a tag produces a deployable image.
+- ✅ **Five jobs, split by what a failure MEANS** rather than by convenience, so a red build says what to do without opening logs: `cpp-correctness` (wrong answer), `cpp-sanitizers` (memory/UB bug), `go-test` (service layer broken), `lint`, `integration` (the pieces do not fit together).
+- ✅ **Timing tests excluded from the gate, in both C++ jobs, for two different reasons:** a shared runner has noisy neighbours so a performance budget there is a coin flip; and sanitizers are 2–3× slower so any budget is meaningless. They still run and print — they just do not block, because a flaky gate teaches people to ignore red builds.
+- ✅ **A real Redis service container** for `go-test`, because the Week 7/10 tests are about Redis *semantics* (no per-member TTL, consumer groups, `XPENDING`). `-race` and `-count=1`: the Go layer is all concurrency, and a cached green result is not evidence the tests ran.
+- ✅ **gofmt is checked, not applied.** A CI job that rewrites your code produces commits nobody reviewed.
+- ✅ **The integration job re-asserts earlier checkpoints on every commit:** the compose stack becomes healthy (Week 14) and a malformed request gets a 4xx rather than a 500 (Week 11).
+- ✅ **Release automation** (`release.yml`) on a `v*.*.*` tag: re-runs the tests rather than trusting CI's result on the same commit (a tag can point at any commit, including one that never saw a pull request), then pushes images to ghcr.io with both an immutable version tag and `:latest`, using the automatic scoped token rather than a long-lived PAT.
+- ✅ **Checkpoint met, and demonstrated the hard way.** The first CI run **failed red** on a genuine problem: golangci-lint's prebuilt binary is compiled against its release's Go and refuses to run when that is older than the module's target — *"go1.23 is lower than the targeted Go version 1.26.4"*. That is the gate doing its job. Fixed by building the linter from source with the runner's Go so the versions cannot drift, and migrating the config to the v2 schema.
+- **Not done:** branch protection requiring these checks is a repository *setting*, not a file, and has not been enabled. Until it is, the gates report but do not literally block a merge.
 
-#### Week 18 · Nov 5, 2026 · API Key Management — ⬜ Not started
+#### Week 18 · Nov 5, 2026 · API Key Management — ✅ Complete
+
 **Baseline deliverable:** Logic handling dropped WebSocket connections, network latency, and basic API key validation.
 *Intent: authenticate clients and survive flaky networks.*
 
-- **Key security.** **Hash API keys at rest** (never store raw), support rotation, and **rate-limit per key**.
-- **Network resilience.** Graceful **WebSocket reconnect with resumable state**, plus the fallback REST path from the risk table.
-- ✅ **Checkpoint:** a revoked key is rejected instantly; a dropped socket reconnects without losing session state.
+- ✅ **Keys hashed at rest, never stored raw** (`internal/auth`). Format `rmk_<key_id>_<secret>`: splitting the id from the secret makes verification an O(1) lookup, where hashing the whole key would force either a scan per request or a reversible (useless) hash. The prefix is deliberately distinctive so secret scanners can match it.
+- ✅ **SHA-256 rather than bcrypt, with the reasoning recorded.** Password hashing is slow *on purpose* because passwords are low-entropy; these secrets are 256 bits from `crypto/rand`, so brute force is not the threat model. bcrypt at ~100 ms would cap the API at roughly ten authenticated requests per second per core and buy nothing. What matters is that a database dump contains no working credentials.
+- ✅ **Constant-time comparison** — a byte-wise `==` returns early on a mismatch, and that timing difference recovers a secret one byte at a time.
+- ✅ **One error for malformed, unknown, revoked and expired**, and the active-check runs *after* the secret comparison. Otherwise an attacker learns which key ids exist without knowing any secret, turning guessing into enumeration.
+- ✅ **Rotation with an overlap window.** Revoking the instant a replacement is minted breaks every client that has not yet redeployed — which is precisely why people avoid rotating, and unrotated keys are the real security problem. `RotatedFrom` links the pair so an operator sees a rotation rather than two unrelated keys.
+- ✅ **Per-key rate limiting** via a Lua script so `INCR` and `EXPIRE` are atomic: as two commands, a crash between them leaves a counter with no TTL that never resets and silently locks that key out forever. **Fails open** — a limiter that fails closed turns a Redis blip into a total outage.
+- ✅ **Correct status codes:** 429 (not 401) when rate limited, because the key is fine; **503 (not 401) when the auth store is down**, because telling a customer their valid key is invalid during our outage sends them rotating credentials that were never the problem. Health probes bypass auth, or every pod is permanently unready.
+- ✅ **Checkpoint, first half:** a revoked key is rejected **instantly** — there is no cache to expire, because every request re-reads the store. The record is retained rather than deleted, so "when was this revoked?" has an answer during incident response.
+- ⚠️ **Checkpoint, second half — partially met.** The WebSocket upgrade is now authenticated *before* upgrading (a 401 is far easier for an integrator to debug than a close frame), and driver state survives a dropped socket because positions live in Redis under a TTL, so a reconnect within the TTL loses nothing. What is **not** built is an explicit resume protocol — a session token and a server-sent "here is your last known state" message. Deferred honestly rather than claimed.
 
-#### Week 19 · Nov 12, 2026 · Data Segregation — ⬜ Not started
-**Baseline deliverable:** Logic handling rider cancellations, driver rejections, and database isolation between institutional clients.
+#### Week 19 · Nov 12, 2026 · Data Segregation — ✅ Complete *(current position — Phase 5 done)*
+
+**Baseline deliverable:** Database isolation between institutional clients.
 *Intent: institutional clients are fully isolated from one another.*
 
-- **Tenant ID everywhere.** Thread it through **every layer** — API auth, queue partitions, cache key prefixes, and logs.
-- **Prove isolation.** Add tests that **confirm tenant A cannot read tenant B's data**. Isolation you haven't tested is isolation you don't have.
-- ✅ **Checkpoint:** an automated test attempts cross-tenant access and is denied at every layer.
+- ✅ **The tenant comes from the authenticated key, never from the request.** This is the line everything else rests on: if a client can name its own tenant, every downstream key prefix is decoration. `Config.TenantID` survives only as a local-development fallback, and there is deliberately no per-request override.
+- ✅ **Threaded through every layer.** API auth → queue streams (`requests:stream:<tenant>`, including the **dead-letter** stream, which is easy to forget and contains rider ids and pickup coordinates) → cache keys (`drivers:geo:<tenant>`) → the engine's `tenant_id` → structured logs.
+- ✅ **The in-memory layer needed a real fix.** The pipeline buffer was keyed by driver id alone. Two operators can both have a `D-001`, and a driver-only key lets one tenant's ping **silently relocate the other's driver** — corruption that would present as a flapping GPS bug. Now keyed by tenant+driver, with each window's writes routed to that tenant's store.
+- ✅ **Checkpoint met** (`internal/tenancy`): a cross-package suite written from the **attacker's** side. One client holding only tenant A's key attempts, in sequence, to spoof a tenant header, read a competitor's drivers, consume another tenant's queue, read another tenant's dead-letter stream, and act unauthenticated — and is denied at every layer. Plus: the same driver id in two tenants stays separate; revoking one tenant's key does not affect another; one tenant's rate limit does not starve another.
+- **Why a separate package:** isolation is a property of the **composition**, not of any one component. Each package's own tests can only check its own layer, and a leak *between* two individually-correct layers is exactly the kind nobody notices.
+- **Not done:** rider cancellations and driver rejections, which the original one-line deliverable also mentioned. They are product state transitions rather than isolation, and are deferred rather than quietly dropped.
 
 ---
 

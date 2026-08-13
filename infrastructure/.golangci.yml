@@ -1,12 +1,15 @@
-# Linter configuration.
+# Linter configuration (golangci-lint v2 schema).
 #
 # Scoped deliberately rather than "enable everything": a linter that fires on
 # every file trains people to ignore it, which is worse than not running one.
-# These are the checks that catch real bugs in this codebase.
+#
+# NOTE ON THE SCHEMA. v2 RENAMED the exclusion keys — `issues.exclude-dirs`
+# became `linters.exclusions.paths`, and `issues.exclude-rules` became
+# `linters.exclusions.rules`. A v1-style config does not error; the exclusions
+# are simply IGNORED, so the first CI run reported dozens of findings the config
+# was supposed to have suppressed. Silent-ignore is the worst kind of config
+# incompatibility, so this is written against v2 explicitly.
 
-# Schema version 2. golangci-lint v2 renamed several top-level keys, and
-# feeding it a v1 config fails with a confusing parse error rather than a
-# helpful migration message.
 version: "2"
 
 run:
@@ -23,26 +26,50 @@ linters:
     - misspell
     - bodyclose     # unclosed HTTP response bodies leak connections
     - noctx         # HTTP requests without a context cannot be cancelled
-    - rowserrcheck
 
-linters-settings: {}
+  exclusions:
+    paths:
+      # Generated protobuf code. Linting it produces noise nobody can act on,
+      # since any fix would have to be made upstream in protoc-gen-go.
+      - gen/
 
-issues:
-  exclude-dirs:
-    # Generated protobuf code. Linting it produces noise nobody can act on,
-    # since the fix would be upstream in protoc-gen-go.
-    - gen
+    rules:
+      # Test files: a t.Fatalf on every cleanup call adds noise, not safety.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - bodyclose
 
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - errcheck    # t.Fatalf on every cleanup call adds noise, not safety
+      # Deliberate fire-and-forget on shutdown paths. `defer thing.Close()` in
+      # main() is idiomatic: the process is exiting and there is nothing useful
+      # to do with the error.
+      - text: "Error return value of `.*\\.(Close|Shutdown)` is not checked"
+        linters:
+          - errcheck
 
-    # Deliberate fire-and-forget on shutdown paths, where the process is
-    # exiting and there is nothing useful to do with the error.
-    - text: "Error return value of .(.*Close|.*Shutdown). is not checked"
-      linters:
-        - errcheck
+      # Writing to an http.ResponseWriter. If the client has gone away the write
+      # fails and there is no recovery — the response is already committed.
+      - text: "Error return value of `(fmt\\.Fprin.*|.*\\.Write)` is not checked"
+        linters:
+          - errcheck
 
-  max-issues-per-linter: 0
-  max-same-issues: 0
+      # A WebSocket dial's *http.Response carries the handshake, not a body to
+      # drain. gorilla documents it as informational.
+      - text: "response body must be closed"
+        path: (cmd/|_test\.go)
+        linters:
+          - bodyclose
+
+      # Test code and test helpers. httptest.NewRequest has no context variant
+      # worth the churn, and the process helpers manage their children's
+      # lifetime explicitly via t.Cleanup rather than via a context.
+      - path: (_test\.go|internal/testutil/)
+        linters:
+          - noctx
+
+      # Standalone tools (cmd/healthcheck, cmd/loadtest). Both already bound
+      # their work with explicit timeouts; threading a context through a
+      # single-purpose CLI adds ceremony without changing behaviour.
+      - path: cmd/(healthcheck|loadtest)/
+        linters:
+          - noctx

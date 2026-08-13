@@ -21,12 +21,17 @@ Two files per week of the 24-week build:
 | 13 | Distributed locking | [week13.md](week13.md) | [learnings13.md](learnings13.md) | ✅ |
 | 14 | Docker Compose | [week14.md](week14.md) | [learnings14.md](learnings14.md) | ✅ |
 | 15 | Load testing | [week15.md](week15.md) | [learnings15.md](learnings15.md) | ✅ |
-| 16 | Kubernetes basics | _next_ | _next_ | ⬜ |
+| 16 | Kubernetes + chaos test | [week16.md](week16.md) | [learnings16.md](learnings16.md) | ✅ |
+| 17 | CI/CD | [week17.md](week17.md) | [learnings17.md](learnings17.md) | ✅ |
+| 18 | API key management | [week18.md](week18.md) | [learnings18.md](learnings18.md) | ✅ |
+| 19 | Data segregation | [week19.md](week19.md) | [learnings19.md](learnings19.md) | ✅ |
+| 20 | Go pprof profiling | _next_ | _next_ | ⬜ |
 
 **Phase 1** (C++ core, weeks 1–5) · **Phase 2** (Go bridge & ingestion, weeks 6–9) ·
 **Phase 3** (message brokering & batching, weeks 10–13) ·
-**Phase 4** (DevOps & benchmarking, weeks 14–15) — **all complete.**
-Phase 5 (production orchestration) starts at week 16.
+**Phase 4** (DevOps & benchmarking, weeks 14–15) ·
+**Phase 5** (production orchestration, weeks 16–19) — **all complete.**
+Phase 6 (enterprise hardening) starts at week 20.
 
 For the full 24-week schedule and design rationale, see
 [../docs/Technical_Design_Document.md](../docs/Technical_Design_Document.md).
