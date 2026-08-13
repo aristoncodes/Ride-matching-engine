@@ -1,7 +1,12 @@
 # ADR-0001: Use a Quadtree for spatial indexing
 
 ## Status
-✅ Accepted (Week 2)
+🟢 **Accepted** — built in Week 2, and its central claim has now been measured twice.
+
+**Validation:**
+- **Correctness vs brute force** (Weeks 2 and 5): `queryRange`, `nearestNeighbor` and `kNearest` are all checked against linear-scan oracles over thousands of randomised queries, plus the edge cases that actually broke it — coincident points, boundary points, and insert/remove churn.
+- **The asymptotic claim, measured** (Week 2): ~160x faster than brute force at N=500,000. Also recorded honestly: at N=100 the tree is 0.3x, i.e. *slower*, because the overhead dominates below a few hundred points.
+- **The claim that actually matters, measured end to end** (Week 15): with the quadtree shortlist, **32x the drivers (500 → 16,000) costs only ~2x the solve time**. That is the O(N·M) bottleneck this ADR was written to avoid, shown not to materialise.
 
 ## Context
 The engine must answer "which drivers are near this rider?" thousands of times per batch. Scanning all M drivers per rider is O(N·M) — the exact bottleneck the project exists to avoid. We need a spatial index that prunes far-away drivers cheaply, in C++ (the CPU-bound tier).

@@ -1,7 +1,13 @@
 # ADR-0005: Batch ride requests in 3-second windows
 
 ## Status
-🟡 Proposed — follows directly from the "Batching over Streaming" tenet; to be validated when the batcher is built (Week 12).
+🟢 **Accepted** — implemented in Weeks 9 and 12, and now measured.
+
+**Validation:**
+- The window is a **config value**, not a constant: `--window` on both `ingestd` (location coalescing) and `batcherd` (match batching), defaulting to 3s. They must agree, since the cache is refreshed on the same cadence it is read.
+- **Dual-trigger flush** (Week 12): the window OR a max batch size, whichever comes first. Time alone lets a spike build an unsolvable batch; size alone leaves a lone rider waiting for company that never arrives.
+- **Amortisation confirmed** (Week 9): coalescing turned 5,438 GPS pings into 2,000 writes, and one batched gRPC call carries hundreds of riders, so the per-call cost ADR-0002 accepted is spread across the batch as intended.
+- **Revised understanding of the size cap** (Week 15): because solve cost is superlinear in N (~O(N^1.33) measured), `MAX_BATCH` turns out to be a **latency** control and not merely a memory bound — four 800-rider batches total ~158 ms against ~328 ms for one 3200-rider batch.
 
 ## Context
 The C++ solver produces a globally optimal assignment over a *set* of riders and drivers. Matching one rider at a time (pure streaming) would (a) forfeit global optimality and (b) incur a cross-language gRPC call per request — the exact overhead flagged as our top risk. We need to trade a small, bounded latency for far better matches and far fewer cross-language calls.

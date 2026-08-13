@@ -1,7 +1,15 @@
 # ADR-0006: Redis Streams (not Kafka) for the ride-request queue
 
 ## Status
-🟡 Proposed — decided before Week 10; to be validated when the queue is built.
+🟢 **Accepted** — built in Week 10 and validated in Weeks 10, 12 and 14.
+
+**Validation:**
+- **Durability under crash** (Week 10 checkpoint): `TestUnackedMessageIsRedelivered` claims a request with one consumer, kills it without acking, and proves another consumer recovers it intact via `XPENDING`/`XCLAIM`. It also proves a plain `Consume` does *not* see it — durability without a reclaim path would have been "lost, slowly".
+- **Dead-letter path works** (Week 10): poison messages and undecodable payloads are set aside and acked, so neither can block the queue.
+- **Consumer groups scale** (Week 10): two consumers over 50 requests, no message delivered to both.
+- **Consumed correctly by the batcher** (Week 12): requests are acked only after matching, and the Week 6 retryable/poison taxonomy routes failures — which is the integration this ADR existed to enable.
+- **The operational argument held** (Week 14): `docker-compose.yml` contains **one** stateful service. Avoiding a second one was the primary reason for this decision, and the compose file is where that either pays off or does not.
+- **The stated downside is mitigated, not ignored:** Redis runs with `appendonly yes` and `appendfsync everysec`, bounding worst-case loss to about a second of requests. This remains genuinely weaker than Kafka's on-disk log, and the "Revisit if" conditions below still stand.
 
 ## Context
 

@@ -1,7 +1,12 @@
 # ADR-0003: Optimal (Hungarian / MCMF) matching over greedy nearest-neighbor
 
 ## Status
-🟡 Proposed (open question) — the *greedy → optimal* direction is settled, but **Hungarian vs. MCMF** and the **unmatched-rider policy (N > M)** are still open, to be resolved when the matcher is built (Week 3).
+🟢 **Accepted** — built in Week 3 and validated repeatedly since.
+
+**Validation:**
+- **Optimality proven, not assumed.** `tests/test_assignment.cpp` checks the MCMF solver against an independent brute-force min-cost-max-matching oracle over 3,000 randomised cases plus hand-picked edge cases, including a greedy trap where greedy scores 101 and the optimum is 4.
+- **Measured against greedy on real data** (Week 4): optimal beat greedy by 30–78% on total distance across batches.
+- **The cost of optimality is measured** (Week 15): the sparse path solves N=M=500 in ~16 ms, while the dense equivalent at N=M=800 takes ~2 s. That is the number that justifies the k-nearest shortlist rather than assuming it.
 
 ## Context
 The core value proposition is *optimal* matching. An interim greedy matcher (each rider grabs its nearest available driver) was built to exercise the quadtree, and it immediately exposed the problem: greedy is order-dependent and can produce globally poor assignments — e.g., an early rider takes the only driver that a much closer later rider needed, inflating total wait time. We must minimize *total* cost across the batch, with each driver used at most once. This is the assignment problem on a bipartite graph.
