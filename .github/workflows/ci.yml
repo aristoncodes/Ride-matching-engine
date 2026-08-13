@@ -1,0 +1,259 @@
+# Quality gates. Nothing merges to main unless every job here is green.
+#
+# The jobs are split by FAILURE MEANING rather than by convenience, so a red
+# build tells you what to do without opening the logs:
+#
+#   cpp-correctness  the engine computes the wrong answer
+#   cpp-sanitizers   memory or undefined-behaviour bug
+#   go-test          the service layer is broken
+#   lint             style/vet issues
+#   integration      the pieces work together
+#
+# A single "test everything" job would be simpler and would lose that.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A new push to the same branch cancels the previous run. Without this, pushing
+# three fixes in a minute burns three full CI runs and the first two are already
+# irrelevant.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.26"
+
+jobs:
+  # ==========================================================================
+  # The C++ engine: does it compute the right answer?
+  # ==========================================================================
+  cpp-correctness:
+    name: C++ correctness
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake protobuf-compiler protobuf-compiler-grpc \
+            libgrpc++-dev libprotobuf-dev
+
+      - name: Generate protobuf stubs
+        # Generated code is a build product, not committed (see the Makefile),
+        # so CI must produce it exactly as a developer's machine does.
+        run: make proto-cpp
+
+      - name: Configure and build
+        run: |
+          cd matching_engine
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j "$(nproc)"
+
+      - name: Run correctness + contract tests
+        # Excludes the timing tests: a shared CI runner has noisy neighbours,
+        # so a performance budget measured there is a coin flip. Asserting one
+        # anyway would train everyone to ignore red builds.
+        run: |
+          cd matching_engine/build
+          ctest --output-on-failure -E performance
+
+      - name: Report timings without gating on them
+        # Still measured, still visible in the log, just not a merge gate.
+        continue-on-error: true
+        run: |
+          cd matching_engine/build
+          ./unit_tests "[perf]" || true
+
+  # ==========================================================================
+  # The C++ engine: is it memory-safe?
+  # ==========================================================================
+  cpp-sanitizers:
+    name: C++ sanitizers (ASan + UBSan)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake protobuf-compiler protobuf-compiler-grpc \
+            libgrpc++-dev libprotobuf-dev
+
+      - name: Generate protobuf stubs
+        run: make proto-cpp
+
+      - name: Build with sanitizers
+        run: |
+          cd matching_engine
+          cmake -B build-asan -S . -DENABLE_SANITIZERS=ON -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build-asan --target unit_tests -j "$(nproc)"
+
+      - name: Run the suite under ASan + UBSan
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1
+        # Timing tests are excluded here for a different reason than above:
+        # sanitizers make everything 2-3x slower, so any budget is meaningless.
+        run: ./matching_engine/build-asan/unit_tests "~[perf]"
+
+  # ==========================================================================
+  # The Go service layer
+  # ==========================================================================
+  go-test:
+    name: Go tests (race detector)
+    runs-on: ubuntu-24.04
+    services:
+      # A real Redis, because the Week 7/10 tests are about Redis SEMANTICS —
+      # per-member TTLs, consumer groups, XPENDING. A fake would have hidden
+      # the constraints those designs were built around.
+      redis:
+        image: redis:8.0.3-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: infrastructure/go.sum
+
+      - name: Install protoc and plugins
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+
+      - name: Generate protobuf stubs
+        run: make proto-go
+
+      - name: Install redis-cli
+        # The test harness starts its own redis-server per test on a unix
+        # socket; the service container above is a fallback for anything that
+        # wants a TCP endpoint.
+        run: sudo apt-get install -y --no-install-recommends redis-tools redis-server
+
+      - name: Build
+        run: cd infrastructure && go build ./...
+
+      - name: Test with the race detector
+        # -race is not optional: the Go layer is all concurrency, and a data
+        # race that only appears under load is exactly what must not ship.
+        # -count=1 disables the test cache, so a green run means it ran.
+        run: cd infrastructure && go test -race -count=1 -timeout 15m ./...
+
+  # ==========================================================================
+  # Lint
+  # ==========================================================================
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: infrastructure/go.sum
+
+      - name: Install protoc and plugins
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+
+      - name: Generate protobuf stubs
+        run: make proto-go
+
+      - name: gofmt
+        # Formatting is checked rather than applied. A CI job that rewrites your
+        # code produces commits nobody reviewed.
+        run: |
+          cd infrastructure
+          unformatted="$(gofmt -l . | grep -v '^gen/' || true)"
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt'd:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: cd infrastructure && go vet ./...
+
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.62
+          working-directory: infrastructure
+          args: --timeout=5m
+
+  # ==========================================================================
+  # Do the pieces work together?
+  # ==========================================================================
+  integration:
+    name: Docker Compose stack
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build all images
+        run: docker compose build
+
+      - name: Boot the stack
+        run: docker compose up -d
+
+      - name: Wait for every service to be healthy
+        # Asserts the Week 14 checkpoint on every commit: `docker compose up`
+        # yields a healthy stack EVERY time, not just on the machine it was
+        # written on.
+        run: |
+          for i in $(seq 1 60); do
+            unhealthy=$(docker compose ps --format '{{.Health}}' | grep -cv healthy || true)
+            if [ "$unhealthy" = "0" ]; then
+              echo "all services healthy after ${i}0s"; docker compose ps; exit 0
+            fi
+            sleep 2
+          done
+          echo "services did not become healthy:"; docker compose ps; docker compose logs; exit 1
+
+      - name: Smoke test the pipeline
+        run: |
+          set -euo pipefail
+          code=$(curl -s -o /tmp/resp -w '%{http_code}' -X POST \
+            localhost:8081/v1/ride-requests -H 'Content-Type: application/json' \
+            -d '{"rider_id":"R-ci","pickup":{"lat":12.9716,"lng":77.5946}}')
+          echo "response: $(cat /tmp/resp)"
+          [ "$code" = "202" ] || { echo "expected 202, got $code"; exit 1; }
+
+          # A malformed request must be a 4xx, never a 500 — the Week 11
+          # checkpoint, enforced on every commit.
+          bad=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            localhost:8081/v1/ride-requests -H 'Content-Type: application/json' \
+            -d '{"rider_id":"R-ci"}')
+          case "$bad" in
+            4*) echo "malformed request correctly rejected with $bad" ;;
+            *)  echo "malformed request returned $bad, expected a 4xx"; exit 1 ;;
+          esac
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

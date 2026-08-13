@@ -1,0 +1,41 @@
+# Linter configuration.
+#
+# Scoped deliberately rather than "enable everything": a linter that fires on
+# every file trains people to ignore it, which is worse than not running one.
+# These are the checks that catch real bugs in this codebase.
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    - errcheck      # unchecked errors — the most common real bug class in Go
+    - govet
+    - ineffassign   # assignments that are never read
+    - staticcheck
+    - unused
+    - misspell
+    - bodyclose     # unclosed HTTP response bodies leak connections
+    - noctx         # HTTP requests without a context cannot be cancelled
+    - rowserrcheck
+
+issues:
+  exclude-dirs:
+    # Generated protobuf code. Linting it produces noise nobody can act on,
+    # since the fix would be upstream in protoc-gen-go.
+    - gen
+
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - errcheck    # t.Fatalf on every cleanup call adds noise, not safety
+
+    # Deliberate fire-and-forget on shutdown paths, where the process is
+    # exiting and there is nothing useful to do with the error.
+    - text: "Error return value of .(.*Close|.*Shutdown). is not checked"
+      linters:
+        - errcheck
+
+  max-issues-per-linter: 0
+  max-same-issues: 0

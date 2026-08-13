@@ -1,0 +1,144 @@
+# Release automation: a git tag produces deployable, versioned images.
+#
+# Separate from ci.yml on purpose. CI answers "is this change safe?" and runs on
+# every push; release answers "ship this exact commit" and runs only on a tag.
+# Merging them would mean either building images for every commit or gating
+# releases behind branch logic inside a workflow that has other jobs to do.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]        # v1.2.3
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version to build (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: read
+  packages: write           # to push to ghcr.io
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # The tests run AGAIN here rather than trusting CI's result on the same
+  # commit. A tag can point at any commit, including one that never went
+  # through a pull request, and "it passed on main" is not the same statement as
+  # "it passes at this tag".
+  verify:
+    name: Verify before release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache-dependency-path: infrastructure/go.sum
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake protobuf-compiler protobuf-compiler-grpc \
+            libgrpc++-dev libprotobuf-dev redis-server redis-tools
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+
+      - name: Generate stubs
+        run: make proto
+
+      - name: C++ tests
+        run: |
+          cd matching_engine
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j "$(nproc)"
+          cd build && ctest --output-on-failure -E performance
+
+      - name: Go tests
+        run: cd infrastructure && go test -race -count=1 -timeout 15m ./...
+
+  images:
+    name: Build and push images
+    needs: verify          # never publish an image from a commit that failed
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - name: engine
+            dockerfile: matching_engine/Dockerfile
+            service: ""
+          - name: ingestd
+            dockerfile: infrastructure/Dockerfile
+            service: ingestd
+          - name: requestd
+            dockerfile: infrastructure/Dockerfile
+            service: requestd
+          - name: batcherd
+            dockerfile: infrastructure/Dockerfile
+            service: batcherd
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the version
+        id: version
+        run: |
+          version="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "releasing $version"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # The automatic token, not a long-lived PAT. It is scoped to this
+          # repository and expires when the job ends.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          build-args: |
+            SERVICE=${{ matrix.service }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.name }}:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.name }}:latest
+          # Both an immutable version tag AND :latest. Deployments should pin
+          # the version — :latest exists for convenience, and pinning is what
+          # makes a rollback a one-line change rather than an archaeology
+          # exercise.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  summary:
+    name: Release summary
+    needs: images
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Write the summary
+        run: |
+          version="${{ github.event.inputs.tag || github.ref_name }}"
+          {
+            echo "## Released \`$version\`"
+            echo
+            echo "| Image | Pull |"
+            echo "|---|---|"
+            for svc in engine ingestd requestd batcherd; do
+              echo "| \`$svc\` | \`docker pull ${{ env.REGISTRY }}/${{ github.repository }}/$svc:$version\` |"
+            done
+            echo
+            echo "Deploy by setting \`TAG=$version\` and re-applying the manifests."
+          } >> "$GITHUB_STEP_SUMMARY"
