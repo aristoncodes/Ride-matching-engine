@@ -61,6 +61,18 @@ type Repository interface {
 	// network latency, not Redis, the bottleneck.
 	UpsertMany(ctx context.Context, locations []DriverLocation) error
 
+	// NearbyMany answers several radius queries in ONE round trip, returning
+	// results positionally.
+	//
+	// Added in Week 22 because profiling showed the batcher spending ~59% of its
+	// CPU inside Redis calls from processBatch — it was issuing one Nearby per
+	// rider, serially, so a 500-rider batch cost 500 round trips. Each is fast;
+	// the LATENCY of doing them one after another is what dominated.
+	//
+	// Positional results rather than a map, so a caller can pair query i with
+	// rider i without inventing keys.
+	NearbyMany(ctx context.Context, queries []Query) ([][]DriverLocation, error)
+
 	// Nearby returns drivers within the radius, nearest first, EXCLUDING any
 	// whose last ping is older than the configured TTL.
 	//

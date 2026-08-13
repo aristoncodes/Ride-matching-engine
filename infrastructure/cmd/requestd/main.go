@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aditya/ride-matching/internal/adminserver"
 	"github.com/aditya/ride-matching/internal/api"
 	"github.com/aditya/ride-matching/internal/queue"
 )
@@ -34,10 +35,35 @@ func main() {
 		tenant    = flag.String("tenant", "default", "tenant id")
 		maxLen    = flag.Int64("stream-maxlen", 1_000_000, "max ride requests retained in the stream")
 	)
+	adminAddr := flag.String("admin-addr", ":6061",
+		"admin/pprof listen address (NEVER expose this publicly)")
+	contentionProfile := flag.Bool("contention-profile", false,
+		"enable block+mutex profiling; adds overhead, use only for a profiling run")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
+
+	// Profiling lives on its own port. See internal/adminserver: importing
+	// net/http/pprof publishes it on http.DefaultServeMux as a side effect, so
+	// keeping it on a separate mux AND a separate listener is what stops heap
+	// dumps and 30-second CPU burns being reachable from the public API.
+	if *contentionProfile {
+		adminserver.EnableContentionProfiling(1)
+		logger.Warn("contention profiling enabled; this adds overhead to every " +
+			"block and mutex operation and changes what you are measuring")
+	}
+	admin := adminserver.New(adminserver.Config{
+		Addr:        *adminAddr,
+		ServiceName: "requestd",
+		Logger:      logger,
+	})
+	admin.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = admin.Shutdown(ctx)
+	}()
 
 	qOpts := queue.DefaultStreamOptions()
 	qOpts.TenantID = *tenant

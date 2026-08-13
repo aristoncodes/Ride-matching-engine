@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aditya/ride-matching/internal/adminserver"
 	"github.com/aditya/ride-matching/internal/ingest"
 	"github.com/aditya/ride-matching/internal/locations"
 	"github.com/aditya/ride-matching/internal/pipeline"
@@ -37,10 +38,35 @@ func main() {
 		maxBuffered = flag.Int("max-buffered", 100000, "maximum distinct drivers buffered per window")
 		reapEvery   = flag.Duration("reap-every", 30*time.Second, "how often to delete stale drivers")
 	)
+	adminAddr := flag.String("admin-addr", ":6060",
+		"admin/pprof listen address (NEVER expose this publicly)")
+	contentionProfile := flag.Bool("contention-profile", false,
+		"enable block+mutex profiling; adds overhead, use only for a profiling run")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
+
+	// Profiling lives on its own port. See internal/adminserver: importing
+	// net/http/pprof publishes it on http.DefaultServeMux as a side effect, so
+	// keeping it on a separate mux AND a separate listener is what stops heap
+	// dumps and 30-second CPU burns being reachable from the public API.
+	if *contentionProfile {
+		adminserver.EnableContentionProfiling(1)
+		logger.Warn("contention profiling enabled; this adds overhead to every " +
+			"block and mutex operation and changes what you are measuring")
+	}
+	admin := adminserver.New(adminserver.Config{
+		Addr:        *adminAddr,
+		ServiceName: "ingestd",
+		Logger:      logger,
+	})
+	admin.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = admin.Shutdown(ctx)
+	}()
 
 	// ---- Redis ----------------------------------------------------------
 	storeOpts := locations.DefaultOptions()

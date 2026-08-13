@@ -426,3 +426,97 @@ func TestOptionsValidation(t *testing.T) {
 		t.Error("expected an error for an empty tenant id")
 	}
 }
+
+// TestNearbyManyMatchesNearby is the Week 22 correctness guard.
+//
+// The pipelined lookup exists purely for speed, so the one thing that must not
+// change is the ANSWER. An optimisation that quietly returns different drivers
+// is a matching bug, not a performance win.
+func TestNearbyManyMatchesNearby(t *testing.T) {
+	repo := newRepo(t, nil)
+	ctx := context.Background()
+
+	for i := 0; i < 60; i++ {
+		if err := repo.UpsertDriver(ctx, fmt.Sprintf("D-%02d", i),
+			baseLat+float64(i%10)*0.002, baseLng+float64(i/10)*0.002); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+	}
+
+	queries := []locations.Query{
+		{Lat: baseLat, Lng: baseLng, Radius: 1000, Limit: 5},
+		{Lat: baseLat + 0.01, Lng: baseLng, Radius: 5000, Limit: 10},
+		{Lat: baseLat, Lng: baseLng + 0.01, Radius: 500, Limit: 3},
+		{Lat: 19.0760, Lng: 72.8777, Radius: 1000, Limit: 5}, // Mumbai: no hits
+	}
+
+	batched, err := repo.NearbyMany(ctx, queries)
+	if err != nil {
+		t.Fatalf("NearbyMany: %v", err)
+	}
+	if len(batched) != len(queries) {
+		t.Fatalf("got %d result sets, want %d — results must be positional",
+			len(batched), len(queries))
+	}
+
+	for i, q := range queries {
+		single, err := repo.Nearby(ctx, q)
+		if err != nil {
+			t.Fatalf("Nearby %d: %v", i, err)
+		}
+		if len(single) != len(batched[i]) {
+			t.Fatalf("query %d: Nearby returned %d drivers, NearbyMany %d",
+				i, len(single), len(batched[i]))
+		}
+		for j := range single {
+			if single[j].DriverID != batched[i][j].DriverID {
+				t.Errorf("query %d position %d: %s vs %s — the pipelined lookup "+
+					"must return the same drivers in the same order",
+					i, j, single[j].DriverID, batched[i][j].DriverID)
+			}
+		}
+	}
+}
+
+func TestNearbyManyExcludesStaleDriversToo(t *testing.T) {
+	// The freshness filter is the part most likely to be lost when batching,
+	// because the union-ZMScore is a different shape from the per-query version.
+	clk := newClock()
+	repo := newRepo(t, clk)
+	ctx := context.Background()
+
+	if err := repo.UpsertDriver(ctx, "D-fresh", baseLat, baseLng); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if err := repo.UpsertDriver(ctx, "D-stale", baseLat+0.0001, baseLng); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	clk.Advance(20 * time.Second)
+	if err := repo.UpsertDriver(ctx, "D-fresh", baseLat, baseLng); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	clk.Advance(20 * time.Second) // D-stale is now 40s old, past the 30s TTL
+
+	got, err := repo.NearbyMany(ctx, []locations.Query{
+		{Lat: baseLat, Lng: baseLng, Radius: 5000, Limit: 10},
+	})
+	if err != nil {
+		t.Fatalf("NearbyMany: %v", err)
+	}
+	if len(got) != 1 || len(got[0]) != 1 {
+		t.Fatalf("got %v, want exactly the one still-pinging driver", got)
+	}
+	if got[0][0].DriverID != "D-fresh" {
+		t.Errorf("got %s, want D-fresh — the batched path must apply the same "+
+			"freshness filter", got[0][0].DriverID)
+	}
+}
+
+func TestNearbyManyHandlesEmptyInput(t *testing.T) {
+	repo := newRepo(t, nil)
+	got, err := repo.NearbyMany(context.Background(), nil)
+	if err != nil || got != nil {
+		t.Errorf("NearbyMany(nil) = %v, %v; want nil, nil", got, err)
+	}
+}

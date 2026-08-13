@@ -358,6 +358,9 @@ func (noopStore) UpsertMany(context.Context, []locations.DriverLocation) error {
 func (noopStore) Nearby(context.Context, locations.Query) ([]locations.DriverLocation, error) {
 	return nil, nil
 }
+func (noopStore) NearbyMany(context.Context, []locations.Query) ([][]locations.DriverLocation, error) {
+	return nil, nil
+}
 func (noopStore) RemoveDriver(context.Context, string) error { return nil }
 func (noopStore) Reap(context.Context) (int, error)          { return 0, nil }
 func (noopStore) Count(context.Context) (int, error)         { return 0, nil }

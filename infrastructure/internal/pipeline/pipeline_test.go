@@ -62,6 +62,9 @@ func (f *fakeStore) UpsertDriver(ctx context.Context, id string, lat, lng float6
 func (f *fakeStore) Nearby(context.Context, locations.Query) ([]locations.DriverLocation, error) {
 	return nil, nil
 }
+func (f *fakeStore) NearbyMany(context.Context, []locations.Query) ([][]locations.DriverLocation, error) {
+	return nil, nil
+}
 func (f *fakeStore) RemoveDriver(context.Context, string) error { return nil }
 func (f *fakeStore) Reap(context.Context) (int, error)          { return 0, nil }
 func (f *fakeStore) Close() error                               { return nil }

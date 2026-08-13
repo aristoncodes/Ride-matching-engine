@@ -360,26 +360,39 @@ func (b *Batcher) processBatch(ctx context.Context, msgs []queue.Message, reason
 	// One radius query per rider. The union is deduplicated because a driver
 	// near two riders must appear ONCE in the batch: sending them twice would
 	// let the solver believe there are two cars where there is one.
-	driverSet := map[string]locations.DriverLocation{}
-	for _, m := range msgs {
-		near, err := b.drivers.Nearby(ctx, locations.Query{
+	// ONE pipelined round trip for the whole batch, not one per rider.
+	//
+	// Week 20's profile showed the batcher spending ~59% of its CPU inside
+	// Redis calls from this function — not because any single query was slow,
+	// but because a 500-rider batch meant 500 sequential round trips. This is
+	// the Week 22 optimisation, and it was chosen because the profiler pointed
+	// at it rather than because it looked slow.
+	queries := make([]locations.Query, len(msgs))
+	for i, m := range msgs {
+		queries[i] = locations.Query{
 			Lat:    m.Request.Lat,
 			Lng:    m.Request.Lng,
 			Radius: b.cfg.SearchRadiusMeters,
 			Limit:  b.cfg.MaxCandidatesPerRider * 4, // slack: the solver picks
-		})
-		if err != nil {
-			// The driver store is down. Every request here is still valid, so
-			// requeue the whole batch rather than failing riders for an outage
-			// that is not their fault.
-			b.cfg.Logger.Error("driver lookup failed; requeueing batch",
-				"batch_id", batchID, "err", err)
-			metrics.Err = err
-			metrics.Requeued = len(msgs)
-			b.requeued.Add(int64(len(msgs)))
-			b.emit(metrics, started)
-			return // no ack: the messages stay pending and are reclaimed
 		}
+	}
+
+	results, err := b.drivers.NearbyMany(ctx, queries)
+	if err != nil {
+		// The driver store is down. Every request here is still valid, so
+		// requeue the whole batch rather than failing riders for an outage
+		// that is not their fault.
+		b.cfg.Logger.Error("driver lookup failed; requeueing batch",
+			"batch_id", batchID, "err", err)
+		metrics.Err = err
+		metrics.Requeued = len(msgs)
+		b.requeued.Add(int64(len(msgs)))
+		b.emit(metrics, started)
+		return // no ack: the messages stay pending and are reclaimed
+	}
+
+	driverSet := map[string]locations.DriverLocation{}
+	for _, near := range results {
 		for _, d := range near {
 			driverSet[d.DriverID] = d
 		}

@@ -25,6 +25,7 @@ import (
 	"time"
 
 	matchingv1 "github.com/aditya/ride-matching/gen/matching/v1"
+	"github.com/aditya/ride-matching/internal/adminserver"
 	"github.com/aditya/ride-matching/internal/batcher"
 	"github.com/aditya/ride-matching/internal/engine"
 	"github.com/aditya/ride-matching/internal/locations"
@@ -45,10 +46,35 @@ func main() {
 		useRoads    = flag.Bool("travel-time", false, "price by road travel time instead of straight-line distance")
 		graphID     = flag.String("graph", "blr-central", "road graph id (with --travel-time)")
 	)
+	adminAddr := flag.String("admin-addr", ":6062",
+		"admin/pprof listen address (NEVER expose this publicly)")
+	contentionProfile := flag.Bool("contention-profile", false,
+		"enable block+mutex profiling; adds overhead, use only for a profiling run")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
+
+	// Profiling lives on its own port. See internal/adminserver: importing
+	// net/http/pprof publishes it on http.DefaultServeMux as a side effect, so
+	// keeping it on a separate mux AND a separate listener is what stops heap
+	// dumps and 30-second CPU burns being reachable from the public API.
+	if *contentionProfile {
+		adminserver.EnableContentionProfiling(1)
+		logger.Warn("contention profiling enabled; this adds overhead to every " +
+			"block and mutex operation and changes what you are measuring")
+	}
+	admin := adminserver.New(adminserver.Config{
+		Addr:        *adminAddr,
+		ServiceName: "batcherd",
+		Logger:      logger,
+	})
+	admin.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = admin.Shutdown(ctx)
+	}()
 
 	// A unique consumer name per process is mandatory: two instances sharing
 	// one would share a pending list, and each would treat the other's

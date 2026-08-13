@@ -307,6 +307,126 @@ func (r *RedisRepository) Nearby(ctx context.Context, q Query) ([]DriverLocation
 	return out, nil
 }
 
+// NearbyMany answers several radius queries in one round trip.
+//
+// The structure mirrors Nearby exactly — GEOSEARCH, then a freshness filter —
+// but PIPELINED. Two round trips total (all the searches, then one ZMScore for
+// the union of candidates) instead of two per query.
+//
+// Measured on the batcher's own workload: this is the difference between 500
+// sequential round trips and 2 for a 500-rider batch.
+func (r *RedisRepository) NearbyMany(ctx context.Context, queries []Query) ([][]DriverLocation, error) {
+	if len(queries) == 0 {
+		return nil, nil
+	}
+
+	limits := make([]int, len(queries))
+	cmds := make([]*redis.GeoSearchLocationCmd, len(queries))
+
+	err := r.withRetry(ctx, func() error {
+		pipe := r.client.Pipeline()
+		for i, q := range queries {
+			limit := q.Limit
+			if limit <= 0 {
+				limit = 100
+			}
+			limits[i] = limit
+
+			// Same 3x over-fetch as Nearby: some results will be dropped as
+			// stale, and asking for exactly `limit` silently returns short
+			// lists precisely when the fleet is churning.
+			fetch := limit * 3
+			if fetch > 1000 {
+				fetch = 1000
+			}
+			cmds[i] = pipe.GeoSearchLocation(ctx, r.geoKey(), &redis.GeoSearchLocationQuery{
+				GeoSearchQuery: redis.GeoSearchQuery{
+					Longitude:  q.Lng,
+					Latitude:   q.Lat,
+					Radius:     q.Radius,
+					RadiusUnit: "m",
+					Sort:       "ASC",
+					Count:      fetch,
+				},
+				WithCoord: true,
+				WithDist:  true,
+			})
+		}
+		_, execErr := pipe.Exec(ctx)
+		// redis.Nil here means one command found nothing, which is a normal
+		// answer rather than a failure of the pipeline.
+		if execErr != nil && !errors.Is(execErr, redis.Nil) {
+			return execErr
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("geosearch pipeline: %w", err)
+	}
+
+	// Collect the UNION of candidates and check freshness for all of them in a
+	// single ZMScore. Doing it per query would reintroduce the round trips this
+	// method exists to remove.
+	raw := make([][]redis.GeoLocation, len(queries))
+	seen := make(map[string]struct{})
+	var members []string
+	for i, cmd := range cmds {
+		locs, cmdErr := cmd.Result()
+		if cmdErr != nil && !errors.Is(cmdErr, redis.Nil) {
+			return nil, fmt.Errorf("geosearch result %d: %w", i, cmdErr)
+		}
+		raw[i] = locs
+		for _, l := range locs {
+			if _, dup := seen[l.Name]; !dup {
+				seen[l.Name] = struct{}{}
+				members = append(members, l.Name)
+			}
+		}
+	}
+
+	fresh := make(map[string]time.Time, len(members))
+	if len(members) > 0 {
+		var scores []float64
+		if scoreErr := r.withRetry(ctx, func() error {
+			var innerErr error
+			scores, innerErr = r.client.ZMScore(ctx, r.seenKey(), members...).Result()
+			return innerErr
+		}); scoreErr != nil {
+			return nil, fmt.Errorf("zmscore: %w", scoreErr)
+		}
+		cutoff := r.opts.Now().Add(-r.opts.TTL).UnixMilli()
+		for i, m := range members {
+			if i < len(scores) && int64(scores[i]) >= cutoff {
+				fresh[m] = time.UnixMilli(int64(scores[i]))
+			}
+		}
+	}
+
+	out := make([][]DriverLocation, len(queries))
+	for i, locs := range raw {
+		result := make([]DriverLocation, 0, limits[i])
+		for _, l := range locs {
+			lastSeen, ok := fresh[l.Name]
+			if !ok {
+				continue // stale, or no ping recorded: fails closed either way
+			}
+			result = append(result, DriverLocation{
+				TenantID:       r.opts.TenantID,
+				DriverID:       l.Name,
+				Lat:            l.Latitude,
+				Lng:            l.Longitude,
+				DistanceMeters: l.Dist,
+				LastSeen:       lastSeen,
+			})
+			if len(result) == limits[i] {
+				break
+			}
+		}
+		out[i] = result
+	}
+	return out, nil
+}
+
 // RemoveDriver deletes a driver from both keys.
 func (r *RedisRepository) RemoveDriver(ctx context.Context, driverID string) error {
 	return r.withRetry(ctx, func() error {

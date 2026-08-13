@@ -34,3 +34,7 @@ matching_engine/gen/
 
 # Local compose env (may contain machine-specific config)
 .env
+
+# pprof captures. Regenerate with ./scripts/profile.sh; the .pb.gz files are
+# machine- and run-specific, so only the analysis is worth committing.
+profiles/
