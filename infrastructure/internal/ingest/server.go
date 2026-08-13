@@ -27,10 +27,17 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"github.com/aditya/ride-matching/internal/auth"
 )
 
 // Ping is one GPS report from a driver.
 type Ping struct {
+	// TenantID is set by the SERVER from the authenticated API key, never read
+	// from the client's message. A driver app that could name its own tenant
+	// could write into another operator's fleet.
+	TenantID string `json:"-"`
+
 	DriverID string  `json:"driver_id"`
 	Lat      float64 `json:"lat"`
 	Lng      float64 `json:"lng"`
@@ -80,6 +87,16 @@ type Config struct {
 	WriteWait time.Duration
 
 	Logger *slog.Logger
+
+	// Keys enables API-key authentication on the upgrade (Week 18). Nil
+	// disables auth, which is fine for local development and is logged loudly.
+	Keys auth.Store
+
+	// TenantID is the fallback when Keys is nil.
+	TenantID string
+
+	// Now is injectable for tests.
+	Now func() time.Time
 }
 
 // DefaultConfig returns production-shaped defaults.
@@ -113,6 +130,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
+	}
+	if c.TenantID == "" {
+		c.TenantID = "default"
+	}
+	if c.Now == nil {
+		c.Now = time.Now
 	}
 }
 
@@ -200,6 +223,41 @@ func (s *Server) Handler() http.HandlerFunc {
 			return
 		}
 
+		// Authenticate BEFORE upgrading. After the handshake the only way to
+		// reject a client is a WebSocket close frame, which many clients
+		// surface as a generic disconnect — a plain 401 is far easier for an
+		// integrator to debug.
+		tenantID := s.cfg.TenantID
+		if s.cfg.Keys != nil {
+			raw := auth.WebSocketKey(r)
+			if raw == "" {
+				s.activeConns.Add(-1)
+				s.rejected.Add(1)
+				http.Error(w, "an API key is required", http.StatusUnauthorized)
+				return
+			}
+			key, err := auth.Verify(r.Context(), s.cfg.Keys, raw, s.cfg.Now())
+			if err != nil {
+				s.activeConns.Add(-1)
+				s.rejected.Add(1)
+				switch {
+				case errors.Is(err, auth.ErrRateLimited):
+					w.Header().Set("Retry-After", "60")
+					http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+				case errors.Is(err, auth.ErrInvalidKey):
+					s.cfg.Logger.Warn("rejected driver stream", "remote", r.RemoteAddr)
+					http.Error(w, "invalid API key", http.StatusUnauthorized)
+				default:
+					// The auth store is down — our fault, not the driver's.
+					http.Error(w, "cannot verify credentials", http.StatusServiceUnavailable)
+				}
+				return
+			}
+			// The tenant is taken from the KEY. A driver app cannot name its
+			// own tenant, so it cannot write into another operator's fleet.
+			tenantID = key.TenantID
+		}
+
 		conn, err := s.upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			// Upgrade already wrote a response; just release the slot.
@@ -209,12 +267,12 @@ func (s *Server) Handler() http.HandlerFunc {
 
 		s.totalConns.Add(1)
 		s.wg.Add(1)
-		go s.serve(conn)
+		go s.serve(conn, tenantID)
 	}
 }
 
 // serve owns one connection for its entire lifetime.
-func (s *Server) serve(conn *websocket.Conn) {
+func (s *Server) serve(conn *websocket.Conn, tenantID string) {
 	defer s.wg.Done()
 	defer s.activeConns.Add(-1)
 	defer conn.Close()
@@ -247,7 +305,7 @@ func (s *Server) serve(conn *websocket.Conn) {
 	var pumps sync.WaitGroup
 	pumps.Add(2)
 	go func() { defer pumps.Done(); s.writePump(ctx, cancel, conn) }()
-	go func() { defer pumps.Done(); s.readPump(ctx, cancel, conn) }()
+	go func() { defer pumps.Done(); s.readPump(ctx, cancel, conn, tenantID) }()
 
 	// Waiting here, rather than returning immediately, is what makes
 	// Shutdown() able to guarantee that no goroutines remain.
@@ -259,7 +317,7 @@ func (s *Server) serve(conn *websocket.Conn) {
 // readPump is the ONLY goroutine that reads from conn. gorilla/websocket
 // permits one concurrent reader and one concurrent writer, and no more —
 // violating that is a data race, not a queue.
-func (s *Server) readPump(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn) {
+func (s *Server) readPump(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn, tenantID string) {
 	defer cancel()
 
 	conn.SetReadLimit(s.cfg.MaxMessageBytes)
@@ -303,6 +361,10 @@ func (s *Server) readPump(ctx context.Context, cancel context.CancelFunc, conn *
 			s.pingsBad.Add(1)
 			continue
 		}
+
+		// Stamped from the AUTHENTICATED connection, discarding whatever the
+		// client may have put in the payload.
+		p.TenantID = tenantID
 
 		s.pings.Add(1)
 		if s.sink != nil {

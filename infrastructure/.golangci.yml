@@ -4,6 +4,11 @@
 # every file trains people to ignore it, which is worse than not running one.
 # These are the checks that catch real bugs in this codebase.
 
+# Schema version 2. golangci-lint v2 renamed several top-level keys, and
+# feeding it a v1 config fails with a confusing parse error rather than a
+# helpful migration message.
+version: "2"
+
 run:
   timeout: 5m
   tests: true
@@ -19,6 +24,8 @@ linters:
     - bodyclose     # unclosed HTTP response bodies leak connections
     - noctx         # HTTP requests without a context cannot be cancelled
     - rowserrcheck
+
+linters-settings: {}
 
 issues:
   exclude-dirs:

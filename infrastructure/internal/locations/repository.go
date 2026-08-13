@@ -15,6 +15,11 @@ import (
 
 // DriverLocation is one driver's last known position.
 type DriverLocation struct {
+	// TenantID identifies which operator's fleet this driver belongs to. Set by
+	// the ingestion layer from the authenticated API key; used to route the
+	// write to the right tenant's keys.
+	TenantID string
+
 	DriverID string
 	Lat      float64
 	Lng      float64

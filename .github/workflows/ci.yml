@@ -196,11 +196,24 @@ jobs:
       - name: go vet
         run: cd infrastructure && go vet ./...
 
-      - uses: golangci/golangci-lint-action@v6
-        with:
-          version: v1.62
-          working-directory: infrastructure
-          args: --timeout=5m
+      # Installed from source with `go install` rather than via the action's
+      # prebuilt binary.
+      #
+      # The prebuilt one is compiled against whatever Go its release used, and
+      # golangci-lint REFUSES to run when that is older than the module's target:
+      #
+      #   can't load config: the Go language version (go1.23) used to build
+      #   golangci-lint is lower than the targeted Go version (1.26.4)
+      #
+      # Building from source uses the runner's Go, so the versions cannot drift
+      # apart. It costs about a minute and removes a whole class of "the linter
+      # is broken, not the code" failures — which is the kind of red build that
+      # teaches people to ignore red builds.
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+
+      - name: golangci-lint
+        run: cd infrastructure && golangci-lint run --timeout=5m
 
   # ==========================================================================
   # Do the pieces work together?

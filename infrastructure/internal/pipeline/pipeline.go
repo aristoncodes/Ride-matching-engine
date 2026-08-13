@@ -113,10 +113,20 @@ type Stats struct {
 	Buffered      int
 }
 
+// StoreFor returns the location store for a tenant.
+//
+// A factory rather than a single Repository, because each tenant's driver
+// positions live under their own Redis key prefix (ADR-0004) and one ingestd
+// now serves many tenants at once (Week 18 put the tenant on the connection,
+// not in the process config). Writing every tenant's drivers into one store
+// would be a cross-tenant data leak dressed up as a caching decision.
+type StoreFor func(tenantID string) locations.Repository
+
 // Pipeline batches pings and flushes them to a location store on a ticker.
 type Pipeline struct {
-	cfg   Config
-	store locations.Repository
+	cfg      Config
+	store    locations.Repository // the single-tenant store, when storeFor is nil
+	storeFor StoreFor
 
 	// The buffer is a map keyed by driver id, which IS the coalescing: a second
 	// ping from the same driver overwrites the first rather than queueing
@@ -133,6 +143,20 @@ type Pipeline struct {
 
 	stopOnce sync.Once
 	done     chan struct{}
+}
+
+// NewMultiTenant creates a pipeline that routes each ping to its tenant's
+// store, as identified by the authenticated API key on the connection.
+func NewMultiTenant(storeFor StoreFor, cfg Config) (*Pipeline, error) {
+	if storeFor == nil {
+		return nil, errors.New("pipeline: storeFor must not be nil")
+	}
+	p, err := New(noopStore{}, cfg)
+	if err != nil {
+		return nil, err
+	}
+	p.storeFor = storeFor
+	return p, nil
 }
 
 // New creates a pipeline. Call Run to start flushing.
@@ -163,7 +187,13 @@ func (p *Pipeline) Accept(_ context.Context, ping ingest.Ping) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	_, known := p.buffer[ping.DriverID]
+	// Keyed by TENANT AND DRIVER, not driver alone. Two tenants can legitimately
+	// use the same driver id ("D-001"), and a driver-only key would let one
+	// tenant's ping silently overwrite the other's position — a cross-tenant
+	// data corruption that would look like a flapping GPS bug.
+	bufKey := ping.TenantID + "\x00" + ping.DriverID
+
+	_, known := p.buffer[bufKey]
 	if !known && len(p.buffer) >= p.cfg.MaxBufferedDrivers {
 		// SHED. Deliberately, and counted — an operator can see it in the
 		// window stats. Note that an update for a driver ALREADY buffered is
@@ -173,7 +203,8 @@ func (p *Pipeline) Accept(_ context.Context, ping ingest.Ping) error {
 		return nil
 	}
 
-	p.buffer[ping.DriverID] = locations.DriverLocation{
+	p.buffer[bufKey] = locations.DriverLocation{
+		TenantID: ping.TenantID,
 		DriverID: ping.DriverID,
 		Lat:      ping.Lat,
 		Lng:      ping.Lng,
@@ -244,13 +275,25 @@ func (p *Pipeline) flush(ctx context.Context) WindowStats {
 		return stats
 	}
 
-	locs := make([]locations.DriverLocation, 0, len(batch))
+	// Grouped by tenant, so each batch of writes goes to that tenant's keys.
+	byTenant := make(map[string][]locations.DriverLocation, 4)
 	for _, l := range batch {
-		locs = append(locs, l)
+		byTenant[l.TenantID] = append(byTenant[l.TenantID], l)
 	}
 
 	started := time.Now()
-	err := p.store.UpsertMany(ctx, locs)
+	var err error
+	for tenant, locs := range byTenant {
+		store := p.store
+		if p.storeFor != nil {
+			store = p.storeFor(tenant)
+		}
+		if writeErr := store.UpsertMany(ctx, locs); writeErr != nil {
+			// Recorded, but the loop continues: one tenant's Redis failure must
+			// not discard another tenant's positions.
+			err = writeErr
+		}
+	}
 	stats.FlushDuration = time.Since(started)
 	stats.FlushError = err
 
@@ -264,12 +307,13 @@ func (p *Pipeline) flush(ctx context.Context) WindowStats {
 		// cheap; OOMing the ingestion layer is not.
 		p.flushFailures.Add(1)
 		p.cfg.Logger.Error("flush failed; window dropped",
-			"window", window, "drivers", len(locs), "err", err)
+			"window", window, "drivers", len(batch), "tenants", len(byTenant), "err", err)
 	} else {
-		p.flushed.Add(int64(len(locs)))
+		p.flushed.Add(int64(len(batch)))
 		p.cfg.Logger.Info("window flushed",
 			"window", window,
-			"drivers", len(locs),
+			"drivers", len(batch),
+			"tenants", len(byTenant),
 			"duration_ms", stats.FlushDuration.Milliseconds(),
 			"pings_total", stats.PingsAccepted,
 			"shed_total", stats.PingsShed)
@@ -303,3 +347,18 @@ func (p *Pipeline) Done() <-chan struct{} { return p.done }
 
 // Compile-time proof the pipeline is a valid ingestion sink.
 var _ ingest.Sink = (*Pipeline)(nil)
+
+// noopStore satisfies locations.Repository for the multi-tenant pipeline,
+// whose writes always go through storeFor. It exists so New's nil-check stays
+// meaningful for the single-tenant path rather than being loosened.
+type noopStore struct{}
+
+func (noopStore) UpsertDriver(context.Context, string, float64, float64) error { return nil }
+func (noopStore) UpsertMany(context.Context, []locations.DriverLocation) error { return nil }
+func (noopStore) Nearby(context.Context, locations.Query) ([]locations.DriverLocation, error) {
+	return nil, nil
+}
+func (noopStore) RemoveDriver(context.Context, string) error { return nil }
+func (noopStore) Reap(context.Context) (int, error)          { return 0, nil }
+func (noopStore) Count(context.Context) (int, error)         { return 0, nil }
+func (noopStore) Close() error                               { return nil }

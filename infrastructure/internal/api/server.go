@@ -27,14 +27,24 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aditya/ride-matching/internal/auth"
 	"github.com/aditya/ride-matching/internal/queue"
 )
 
 // Config tunes the server.
 type Config struct {
-	// TenantID until real API-key auth arrives in Week 18. Named explicitly
-	// rather than left implicit so the seam is obvious when auth lands.
+	// TenantID is the FALLBACK used only when no auth store is configured
+	// (local development, and the Week 9-15 demos). When Keys is set, the
+	// tenant comes from the authenticated API key instead and this is ignored.
+	//
+	// Week 19's isolation depends on never trusting a client-supplied tenant,
+	// so there is deliberately no way to override it per request.
 	TenantID string
+
+	// Keys enables API-key authentication (Week 18). Nil disables auth
+	// entirely, which is acceptable for local development and is logged loudly
+	// at startup so it cannot ship unnoticed.
+	Keys auth.Store
 
 	// MaxBodyBytes caps a request body. A ride request is ~150 bytes; without
 	// a cap a client can stream gigabytes into the decoder and the process
@@ -162,7 +172,27 @@ func (s *Server) Routes() http.Handler {
 	// instead of Go's default plain-text 404.
 	mux.HandleFunc("/", s.handleNotFound)
 
-	return s.recoverPanics(s.withRequestID(s.logRequests(mux)))
+	handler := http.Handler(mux)
+
+	// Auth sits INSIDE request-id and logging so that a rejected request still
+	// gets an id and a log line — an operator debugging "my key stopped
+	// working" needs both. It sits OUTSIDE the routes so no handler can ever
+	// run unauthenticated.
+	if s.cfg.Keys != nil {
+		handler = auth.Middleware(auth.Options{
+			Store:  s.cfg.Keys,
+			Logger: s.cfg.Logger,
+			Now:    s.cfg.Now,
+			WriteError: func(w http.ResponseWriter, status int, code, message string, r *http.Request) {
+				writeError(w, status, code, message, "", RequestIDFrom(r.Context()))
+			},
+			// Probes have no API key. Requiring one would make every pod
+			// permanently unready — an outage caused by the auth layer.
+			SkipPaths: []string{"/healthz", "/readyz"},
+		})(handler)
+	}
+
+	return s.recoverPanics(s.withRequestID(s.logRequests(handler)))
 }
 
 // ---- Middleware --------------------------------------------------------
@@ -320,11 +350,20 @@ func (s *Server) handleCreateRideRequest(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// The tenant comes from the AUTHENTICATED key, never from the request.
+	// This single line is where Week 19's isolation is actually enforced for
+	// the write path: a client cannot address another tenant's queue because it
+	// has no way to say which tenant it is.
+	tenantID := s.cfg.TenantID
+	if authenticated, ok := auth.TenantFromContext(r.Context()); ok {
+		tenantID = authenticated
+	}
+
 	// The request id doubles as the queue's idempotency key, so a redelivered
 	// message is traceable all the way back to this HTTP call.
 	req := queue.RideRequest{
 		RequestID:   requestID,
-		TenantID:    s.cfg.TenantID,
+		TenantID:    tenantID,
 		RiderID:     input.RiderID,
 		Lat:         *input.Pickup.Lat,
 		Lng:         *input.Pickup.Lng,
