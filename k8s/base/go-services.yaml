@@ -1,0 +1,228 @@
+# The three Go services.
+#
+# All stateless, which is what makes them the ones worth autoscaling: any
+# replica can serve any request, and adding one adds capacity immediately.
+# (batcherd is a partial exception — see the note on its HPA below.)
+#
+# NodePorts are used instead of an Ingress because kind forwards them straight
+# to the host, so the load generator and chaos test reach the cluster without a
+# `kubectl port-forward` proxy in the path. An Ingress controller would be the
+# right answer in a real cluster and adds a moving part this week does not need.
+
+# =============================================================================
+# ingestd — driver GPS ingestion over WebSockets
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingestd
+  namespace: ride-matching
+  labels: { app.kubernetes.io/name: ingestd, app.kubernetes.io/part-of: ride-matching }
+spec:
+  type: NodePort
+  selector: { app.kubernetes.io/name: ingestd }
+  # WebSockets are long-lived, so a client sticks to whichever pod it first
+  # reached for the life of the connection. That is fine here — drivers write
+  # to shared Redis, so no pod holds state another needs — but it does mean
+  # scaling out does NOT rebalance existing connections, only new ones.
+  sessionAffinity: ClientIP
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      nodePort: 30080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingestd
+  namespace: ride-matching
+  labels: { app.kubernetes.io/name: ingestd, app.kubernetes.io/part-of: ride-matching }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app.kubernetes.io/name: ingestd }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: ingestd, app.kubernetes.io/part-of: ride-matching }
+    spec:
+      # Long enough for the WebSocket server's graceful shutdown (Week 8) to
+      # close connections and let the pipeline flush its final window. Cut this
+      # short and every rolling update silently drops the last 3 seconds of
+      # driver positions.
+      terminationGracePeriodSeconds: 45
+      securityContext: { runAsNonRoot: true, runAsUser: 10001 }
+      containers:
+        - name: ingestd
+          image: ride-matching/ingestd:dev
+          imagePullPolicy: Never
+          args:
+            - --addr=:8080
+            - --redis=redis:6379
+            - --tenant=default
+            - --window=3s
+            - --ttl=30s
+            - --max-conns=20000
+          ports: [{ name: http, containerPort: 8080 }]
+          resources:
+            requests: { cpu: 100m, memory: 64Mi }
+            limits:   { cpu: "1",  memory: 256Mi }
+          livenessProbe:
+            # /healthz deliberately does NOT check Redis (Week 11). A liveness
+            # probe that fails during a Redis outage restarts every pod in the
+            # fleet, which fixes nothing and removes capacity exactly when the
+            # system is already degraded.
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            failureThreshold: 2
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+# =============================================================================
+# requestd — rider REST front door
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: requestd
+  namespace: ride-matching
+  labels: { app.kubernetes.io/name: requestd, app.kubernetes.io/part-of: ride-matching }
+spec:
+  type: NodePort
+  selector: { app.kubernetes.io/name: requestd }
+  ports:
+    - name: http
+      port: 8081
+      targetPort: http
+      nodePort: 30081
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: requestd
+  namespace: ride-matching
+  labels: { app.kubernetes.io/name: requestd, app.kubernetes.io/part-of: ride-matching }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app.kubernetes.io/name: requestd }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: requestd, app.kubernetes.io/part-of: ride-matching }
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext: { runAsNonRoot: true, runAsUser: 10001 }
+      containers:
+        - name: requestd
+          image: ride-matching/requestd:dev
+          imagePullPolicy: Never
+          args:
+            - --addr=:8081
+            - --redis=redis:6379
+            - --tenant=default
+          ports: [{ name: http, containerPort: 8081 }]
+          resources:
+            requests: { cpu: 100m, memory: 64Mi }
+            limits:   { cpu: "1",  memory: 256Mi }
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            # /readyz, which DOES check the queue. A front door that cannot
+            # enqueue should be pulled from the load balancer rather than
+            # accepting requests it will 503. This is the Week 11 split doing
+            # its job: liveness above keeps the pod alive, readiness here stops
+            # traffic reaching it.
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+            failureThreshold: 2
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+# =============================================================================
+# batcherd — pops requests, batches, calls the engine
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: batcherd
+  namespace: ride-matching
+  labels: { app.kubernetes.io/name: batcherd, app.kubernetes.io/part-of: ride-matching }
+spec:
+  type: NodePort
+  selector: { app.kubernetes.io/name: batcherd }
+  ports:
+    - name: http
+      port: 8082
+      targetPort: http
+      nodePort: 30082
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: batcherd
+  namespace: ride-matching
+  labels: { app.kubernetes.io/name: batcherd, app.kubernetes.io/part-of: ride-matching }
+spec:
+  # Two consumers in one Redis Streams consumer group, so each request goes to
+  # exactly one of them (asserted by a Week 10 test). Scaling batchers scales
+  # throughput without duplicating work.
+  replicas: 2
+  selector:
+    matchLabels: { app.kubernetes.io/name: batcherd }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: batcherd, app.kubernetes.io/part-of: ride-matching }
+    spec:
+      # The longest grace period here, because a batcher killed mid-batch leaves
+      # requests claimed-but-unacked. They are NOT lost — another instance
+      # reclaims them — but that costs a reclaim cycle, so letting it finish is
+      # better for the riders in that batch.
+      terminationGracePeriodSeconds: 45
+      securityContext: { runAsNonRoot: true, runAsUser: 10001 }
+      containers:
+        - name: batcherd
+          image: ride-matching/batcherd:dev
+          imagePullPolicy: Never
+          args:
+            - --redis=redis:6379
+            - --engine=matching-engine:50051
+            - --metrics-addr=:8082
+            - --tenant=default
+            - --window=3s
+            - --max-batch=500
+            - --candidates=8
+            # Consumer name MUST be unique per pod. Two consumers sharing a name
+            # share a pending list, and each treats the other's in-flight work as
+            # abandoned. The pod name is unique and stable for the pod's life,
+            # which is exactly the property needed.
+            - --consumer=$(POD_NAME)
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+          ports: [{ name: http, containerPort: 8082 }]
+          resources:
+            requests: { cpu: 200m, memory: 128Mi }
+            limits:   { cpu: "2",  memory: 512Mi }
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            failureThreshold: 2
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }

@@ -8,7 +8,11 @@
 **/build-*/
 infrastructure/gen/
 matching_engine/gen/
-matching_engine/data/
+# The road extract IS needed in the build context now: matching_engine/Dockerfile
+# bakes a default graph into the image so `kubectl apply` needs no volume
+# plumbing. Only the raw untrimmed downloads are excluded.
+matching_engine/data/*.osm.pbf
+matching_engine/data/raw/
 weekly report/
 docs/
 !docs/api/matching.proto

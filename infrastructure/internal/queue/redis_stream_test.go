@@ -393,3 +393,105 @@ func TestDepthAndPendingReportQueueHealth(t *testing.T) {
 		t.Errorf("pending = %d, want 2", p)
 	}
 }
+
+// TestUnmatchedRiderIsNotTreatedAsPoison pins the bug the Week 16 chaos test
+// found.
+//
+// Two mechanisms collided:
+//   - Week 10 counts DELIVERIES to detect poison messages.
+//   - Week 12 deliberately leaves an unmatched rider un-acked so a later window
+//     can try again.
+//
+// Both look identical to the broker, so a rider who simply could not find a car
+// accumulated deliveries until the poison detector dead-lettered them. Observed
+// live: delivery count 4 of a maximum 5, on perfectly valid requests.
+//
+// Republish is the fix: it resets the infrastructure counter and advances a
+// separate, business-level MatchAttempts instead.
+func TestUnmatchedRiderIsNotTreatedAsPoison(t *testing.T) {
+	proc := testutil.StartRedis(t)
+	ctx := context.Background()
+	q := newQueue(t, proc.Addr, "matcher") // MaxDeliveries = 3
+
+	if _, err := q.Publish(ctx, request("req-unlucky")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	// Ten windows go by with no driver available — comfortably past
+	// MaxDeliveries. Before the fix this dead-lettered on the 4th.
+	for window := 0; window < 10; window++ {
+		msgs, err := q.Consume(ctx, 10, time.Second)
+		if err != nil {
+			t.Fatalf("window %d consume: %v", window, err)
+		}
+		if len(msgs) != 1 {
+			t.Fatalf("window %d: got %d messages, want 1 — the request vanished",
+				window, len(msgs))
+		}
+		if got := msgs[0].Request.RequestID; got != "req-unlucky" {
+			t.Fatalf("window %d: request_id = %q", window, got)
+		}
+		// Still unmatched, so it goes back for another window.
+		if err := q.Republish(ctx, msgs[0]); err != nil {
+			t.Fatalf("window %d republish: %v", window, err)
+		}
+	}
+
+	// Never discarded.
+	if dead, err := q.DeadLetterDepth(ctx); err != nil || dead != 0 {
+		t.Fatalf("dead-letter depth = %d (err %v), want 0 — an unmatched rider "+
+			"is not poison", dead, err)
+	}
+
+	// And the business-level counter is what actually advanced, so a caller can
+	// still decide to give up on an informed basis.
+	msgs, err := q.Consume(ctx, 10, time.Second)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("final consume: got %d (err %v)", len(msgs), err)
+	}
+	if got := msgs[0].Request.MatchAttempts; got != 10 {
+		t.Errorf("MatchAttempts = %d, want 10", got)
+	}
+	if msgs[0].Deliveries > 1 {
+		t.Errorf("Deliveries = %d — republishing must reset the infrastructure "+
+			"retry counter, not accumulate it", msgs[0].Deliveries)
+	}
+}
+
+func TestRepublishPreservesThePayload(t *testing.T) {
+	proc := testutil.StartRedis(t)
+	ctx := context.Background()
+	q := newQueue(t, proc.Addr, "c1")
+
+	original := request("req-keep")
+	original.Lat, original.Lng = 12.9716, 77.5946
+	if _, err := q.Publish(ctx, original); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	msgs, err := q.Consume(ctx, 1, time.Second)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("consume: got %d (err %v)", len(msgs), err)
+	}
+	if err := q.Republish(ctx, msgs[0]); err != nil {
+		t.Fatalf("republish: %v", err)
+	}
+
+	// The original must be acked, or it would be redelivered as well and the
+	// rider would be matched twice.
+	if pending, _ := q.Pending(ctx); pending != 0 {
+		t.Errorf("pending = %d after republish, want 0 — the original must be acked", pending)
+	}
+
+	again, err := q.Consume(ctx, 1, time.Second)
+	if err != nil || len(again) != 1 {
+		t.Fatalf("re-consume: got %d (err %v)", len(again), err)
+	}
+	got := again[0].Request
+	if got.RequestID != "req-keep" || got.Lat != 12.9716 || got.Lng != 77.5946 {
+		t.Errorf("payload mangled by republish: %+v", got)
+	}
+	if got.RiderID != original.RiderID {
+		t.Errorf("rider id = %q, want %q", got.RiderID, original.RiderID)
+	}
+}

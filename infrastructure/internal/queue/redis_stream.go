@@ -175,18 +175,39 @@ func (q *RedisStream) Publish(ctx context.Context, req RideRequest) (string, err
 		MaxLen: q.opts.MaxLen,
 		Approx: true, // `MAXLEN ~`: trim on node boundaries, far cheaper
 		Values: map[string]interface{}{
-			"request_id":   req.RequestID,
-			"tenant_id":    req.TenantID,
-			"rider_id":     req.RiderID,
-			"lat":          strconv.FormatFloat(req.Lat, 'f', -1, 64),
-			"lng":          strconv.FormatFloat(req.Lng, 'f', -1, 64),
-			"requested_at": strconv.FormatInt(requestedAt.UnixMilli(), 10),
+			"request_id":     req.RequestID,
+			"tenant_id":      req.TenantID,
+			"rider_id":       req.RiderID,
+			"lat":            strconv.FormatFloat(req.Lat, 'f', -1, 64),
+			"lng":            strconv.FormatFloat(req.Lng, 'f', -1, 64),
+			"requested_at":   strconv.FormatInt(requestedAt.UnixMilli(), 10),
+			"match_attempts": strconv.Itoa(req.MatchAttempts),
 		},
 	}).Result()
 	if err != nil {
 		return "", fmt.Errorf("queue: publish: %w", err)
 	}
 	return id, nil
+}
+
+// Republish puts a request back for a later window and acks the original.
+func (q *RedisStream) Republish(ctx context.Context, msg Message) error {
+	req := msg.Request
+	req.MatchAttempts++
+
+	// Publish FIRST. If the process dies between these two calls the request is
+	// duplicated rather than lost, and RequestID makes a duplicate detectable.
+	// The reverse order would ack a message that was never re-queued, which is
+	// precisely the silent drop this whole package exists to prevent.
+	if _, err := q.Publish(ctx, req); err != nil {
+		return fmt.Errorf("queue: republish: %w", err)
+	}
+	if msg.ID != "" {
+		if err := q.Ack(ctx, msg.ID); err != nil {
+			return fmt.Errorf("queue: republish ack: %w", err)
+		}
+	}
+	return nil
 }
 
 // Consume claims up to max new messages for this consumer.
@@ -416,16 +437,20 @@ func decode(entry redis.XMessage) (Message, error) {
 	if ms, err := strconv.ParseInt(get("requested_at"), 10, 64); err == nil {
 		requestedAt = time.UnixMilli(ms)
 	}
+	// Absent on entries written before this field existed; 0 is the right
+	// default for them, so a missing value is not an error.
+	attempts, _ := strconv.Atoi(get("match_attempts"))
 
 	return Message{
 		ID: entry.ID,
 		Request: RideRequest{
-			RequestID:   requestID,
-			TenantID:    get("tenant_id"),
-			RiderID:     get("rider_id"),
-			Lat:         lat,
-			Lng:         lng,
-			RequestedAt: requestedAt,
+			RequestID:     requestID,
+			TenantID:      get("tenant_id"),
+			RiderID:       get("rider_id"),
+			Lat:           lat,
+			Lng:           lng,
+			RequestedAt:   requestedAt,
+			MatchAttempts: attempts,
 		},
 	}, nil
 }

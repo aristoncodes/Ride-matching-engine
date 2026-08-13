@@ -58,6 +58,7 @@ func (f *fakeQueue) Reclaim(context.Context, time.Duration, int) ([]queue.Messag
 	return nil, nil
 }
 func (f *fakeQueue) DeadLetter(context.Context, queue.Message, string) error { return nil }
+func (f *fakeQueue) Republish(context.Context, queue.Message) error          { return nil }
 func (f *fakeQueue) Pending(context.Context) (int64, error)                  { return 0, nil }
 func (f *fakeQueue) DeadLetterDepth(context.Context) (int64, error)          { return 0, nil }
 func (f *fakeQueue) Close() error                                            { return nil }

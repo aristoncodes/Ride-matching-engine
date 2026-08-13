@@ -60,11 +60,20 @@ RUN useradd --system --uid 10001 --no-create-home engine
 
 COPY --from=builder /src/matching_engine/build/matching_server /usr/local/bin/matching_server
 
-# Road graph data is mounted rather than baked in: it is 3.3 MB today and a
-# whole-country extract would be gigabytes, and it changes on a completely
-# different schedule from the code.
-RUN mkdir -p /data && chown engine:engine /data
-VOLUME ["/data"]
+# A DEFAULT road graph is baked in, and larger ones are mounted over it.
+#
+# The original version mounted the graph exclusively, which works under Docker
+# Compose (there is a host directory to bind) and fails in Kubernetes (there is
+# not). A 3.3 MB default on a 179 MB image is negligible and makes the image
+# self-contained, so `kubectl apply` works with no volume plumbing at all.
+#
+# The reasoning behind mounting still holds for anything bigger: a country-sized
+# extract is gigabytes and changes on a different schedule from the code, so
+# production overrides /data with a PVC or an object-store sidecar. Baked-in is
+# the default, not the only option.
+RUN mkdir -p /data
+COPY matching_engine/data/bengaluru_roads.osm /data/bengaluru_roads.osm
+RUN chown -R engine:engine /data
 
 USER engine
 EXPOSE 50051

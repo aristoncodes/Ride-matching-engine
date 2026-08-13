@@ -1,0 +1,53 @@
+# A local Kubernetes cluster, for developing and chaos-testing the manifests.
+#
+# kind runs Kubernetes nodes as Docker containers. Chosen over minikube/k3d for
+# two reasons that matter here:
+#
+#   1. `kind load docker-image` pushes a locally-built image straight into the
+#      cluster. Our images exist only on this machine, and without that we would
+#      need a registry just to run a test.
+#   2. Creating and destroying a cluster takes seconds, so the chaos test can
+#      run against a clean cluster rather than accumulated state.
+#
+# This is NOT a production topology. A real deployment would run Redis outside
+# the cluster (or as a managed service) and spread nodes across zones. What it
+# does reproduce faithfully is the thing under test: pods dying and being
+# rescheduled while traffic flows.
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: ride-matching
+
+nodes:
+  - role: control-plane
+    # Pinned by digest as well as tag. A kind node image is a full Kubernetes
+    # release; "v1.36" moving underneath us would change API versions and
+    # scheduler behaviour between runs.
+    #
+    # This digest is the DEFAULT image compiled into kind v0.32.0 — read out of
+    # the binary rather than guessed. A digest that does not exist fails the
+    # cluster create with a confusing "not found" from the registry, which is
+    # exactly what happened when this was first written from memory.
+    image: kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5
+
+    # Ports forwarded to the host so the load generator and chaos test can
+    # reach the services without kubectl port-forward, which adds a proxy hop
+    # and its own failure modes to a test about failure modes.
+    extraPortMappings:
+      - containerPort: 30080   # ingestd   (driver WebSockets)
+        hostPort: 30080
+        protocol: TCP
+      - containerPort: 30081   # requestd  (rider REST)
+        hostPort: 30081
+        protocol: TCP
+      - containerPort: 30082   # batcherd  (metrics)
+        hostPort: 30082
+        protocol: TCP
+
+  # Two workers, so the scheduler has somewhere to put a pod when a node's
+  # worth of capacity disappears — and so anti-affinity rules are meaningful
+  # rather than silently unsatisfiable.
+  - role: worker
+    image: kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5
+  - role: worker
+    image: kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5

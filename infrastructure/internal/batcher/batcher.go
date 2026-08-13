@@ -66,6 +66,16 @@ type Config struct {
 	ReclaimEvery   time.Duration
 	ReclaimMinIdle time.Duration
 
+	// MaxMatchAttempts is how many windows a rider may go unmatched before the
+	// system gives up and tells them so.
+	//
+	// This is a PRODUCT decision, not an infrastructure one, and keeping it
+	// separate from the queue's MaxDeliveries is the whole point: "no car was
+	// available five times running" is a legitimate answer to give a customer,
+	// whereas "the consumer crashed five times" is an operational fault they
+	// should never see. Conflating them dead-letters real riders as poison.
+	MaxMatchAttempts int
+
 	Logger *slog.Logger
 
 	// OnBatch receives per-batch metrics. Week 20-22's tuning needs these
@@ -86,8 +96,12 @@ func DefaultConfig() Config {
 		SolveTimeout:          2 * time.Second,
 		ReclaimEvery:          30 * time.Second,
 		ReclaimMinIdle:        60 * time.Second,
-		Logger:                slog.Default(),
-		Now:                   time.Now,
+		// ~1 minute of trying at a 3s window. Long enough to ride out a quiet
+		// patch or a driver shift change; short enough that a rider in a dead
+		// zone is told "no cars" rather than left waiting indefinitely.
+		MaxMatchAttempts: 20,
+		Logger:           slog.Default(),
+		Now:              time.Now,
 	}
 }
 
@@ -113,6 +127,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.ReclaimMinIdle <= 0 {
 		c.ReclaimMinIdle = d.ReclaimMinIdle
+	}
+	if c.MaxMatchAttempts <= 0 {
+		c.MaxMatchAttempts = d.MaxMatchAttempts
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
@@ -142,6 +159,7 @@ type BatchMetrics struct {
 	Matched       int
 	Unmatched     int
 	Requeued      int
+	Exhausted     int // gave up: no driver found within MaxMatchAttempts
 	DeadLettered  int
 	QueueWaitP50  time.Duration // how long the median request waited to be batched
 	SolveDuration time.Duration // time inside the C++ engine
@@ -160,6 +178,7 @@ type Stats struct {
 	Matched      int64
 	Unmatched    int64
 	Requeued     int64
+	Exhausted    int64
 	DeadLettered int64
 	SolveErrors  int64
 }
@@ -176,6 +195,7 @@ type Batcher struct {
 	matched      atomic.Int64
 	unmatched    atomic.Int64
 	requeued     atomic.Int64
+	exhausted    atomic.Int64
 	deadLettered atomic.Int64
 	solveErrors  atomic.Int64
 
@@ -214,6 +234,7 @@ func (b *Batcher) Stats() Stats {
 		Matched:      b.matched.Load(),
 		Unmatched:    b.unmatched.Load(),
 		Requeued:     b.requeued.Load(),
+		Exhausted:    b.exhausted.Load(),
 		DeadLettered: b.deadLettered.Load(),
 		SolveErrors:  b.solveErrors.Load(),
 	}
@@ -442,17 +463,47 @@ func (b *Batcher) processBatch(ctx context.Context, msgs []queue.Message, reason
 	}
 
 	var ackIDs []string
-	var requeue int
+	var requeue, exhausted int
 	for _, m := range msgs {
 		if matchedRequests[m.Request.RequestID] {
 			// Matched: the work is done, so the request can finally be acked.
 			ackIDs = append(ackIDs, m.ID)
 			continue
 		}
-		// Unmatched. NOT acked: the rider is still waiting, and leaving the
-		// message pending means it is retried in a later window when more
-		// drivers may be available. This is the "retain and retry" tenet made
-		// concrete — an unmatched rider is not a completed request.
+
+		// Unmatched — a normal outcome, not a failure. The rider is still
+		// waiting, so the request goes back for a later window when more
+		// drivers may be on shift.
+		//
+		// REPUBLISHED rather than left pending, and that distinction is a bug
+		// fix rather than a style choice. Leaving it pending accumulates the
+		// queue's DELIVERY count, which exists to detect poison messages — so a
+		// rider who simply cannot find a car would eventually be dead-lettered
+		// as though their request were malformed. A chaos test caught exactly
+		// that: delivery counts climbing to 4 of 5 on perfectly valid riders.
+		//
+		// Republishing resets the infrastructure counter and advances a
+		// separate, business-level MatchAttempts instead.
+		if m.Request.MatchAttempts+1 >= b.cfg.MaxMatchAttempts {
+			// Genuinely out of options. This IS a real answer for the rider —
+			// "no cars available" — so it is surfaced deliberately rather than
+			// retried forever.
+			if err := b.queue.DeadLetter(ctx, m, fmt.Sprintf(
+				"no driver found after %d match attempts", m.Request.MatchAttempts+1)); err != nil {
+				b.cfg.Logger.Error("could not dead-letter an exhausted request",
+					"request_id", m.Request.RequestID, "err", err)
+				continue
+			}
+			exhausted++
+			continue
+		}
+
+		if err := b.queue.Republish(ctx, m); err != nil {
+			// The republish failed, so do NOT ack: the message stays pending
+			// and is reclaimed. Slower, but it cannot be lost.
+			b.cfg.Logger.Error("could not republish an unmatched request",
+				"request_id", m.Request.RequestID, "err", err)
+		}
 		requeue++
 	}
 
@@ -468,11 +519,13 @@ func (b *Batcher) processBatch(ctx context.Context, msgs []queue.Message, reason
 	}
 
 	metrics.Matched = len(matchedRequests)
-	metrics.Unmatched = requeue
+	metrics.Unmatched = requeue + exhausted
 	metrics.Requeued = requeue
+	metrics.Exhausted = exhausted
 	b.matched.Add(int64(len(matchedRequests)))
-	b.unmatched.Add(int64(requeue))
+	b.unmatched.Add(int64(requeue + exhausted))
 	b.requeued.Add(int64(requeue))
+	b.exhausted.Add(int64(exhausted))
 
 	b.emit(metrics, started)
 }
@@ -490,6 +543,7 @@ func (b *Batcher) emit(m BatchMetrics, started time.Time) {
 		"drivers", m.Drivers,
 		"matched", m.Matched,
 		"unmatched", m.Unmatched,
+		"exhausted", m.Exhausted,
 		"match_rate", fmt.Sprintf("%.2f", m.MatchRate),
 		"queue_wait_p50_ms", m.QueueWaitP50.Milliseconds(),
 		"solve_ms", m.SolveDuration.Milliseconds(),

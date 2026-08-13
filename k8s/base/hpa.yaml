@@ -1,0 +1,106 @@
+# Horizontal Pod Autoscalers for the stateless Go services.
+#
+# Requires metrics-server; without it the HPA reports <unknown> for every
+# metric and never scales. On kind that means installing it with
+# --kubelet-insecure-tls, because kind's kubelet serves a self-signed cert.
+#
+# Why these two and not the others:
+#   requestd  - purely stateless; any replica serves any request.
+#   ingestd   - stateless too, but see the caveat on connections below.
+#   batcherd  - NOT autoscaled. See the note at the bottom.
+#   redis     - stateful; scaling it means replication, not more pods.
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: requestd
+  namespace: ride-matching
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: requestd
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # 70% of the REQUEST (100m), not the limit. This is the most commonly
+          # misread number in an HPA: utilisation is measured against
+          # resources.requests, so a pod using 70m of its 100m request is at
+          # 70% even though its limit is 1000m.
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      # React fast to a spike — a concert letting out is the scenario this
+      # whole system exists for.
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100          # double the replicas at most
+          periodSeconds: 30
+    scaleDown:
+      # Scale down SLOWLY. Aggressive scale-down oscillates: remove pods, load
+      # per pod rises, scale back up, repeat. Five minutes of stability before
+      # shrinking is the standard defence against that flapping.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ingestd
+  namespace: ride-matching
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ingestd
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+    scaleDown:
+      # Even slower than requestd. Removing an ingestd pod kills every
+      # WebSocket connection it holds, forcing those drivers to reconnect —
+      # so a scale-down here has a real client-visible cost that a stateless
+      # HTTP scale-down does not.
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+
+# ---------------------------------------------------------------------------
+# Why batcherd has no HPA
+#
+# CPU is the wrong signal for it. A batcher spends most of its time BLOCKED on
+# XREADGROUP waiting for work, so it looks idle precisely when the queue is
+# backing up — CPU-based autoscaling would scale it DOWN under load.
+#
+# The right signal is queue depth (XLEN / consumer-group lag), which needs a
+# custom or external metric adapter (KEDA, or prometheus-adapter). That is a
+# genuine piece of work rather than a line of YAML, so it is deferred rather
+# than faked with a metric that would actively mislead.
+#
+# Meanwhile two replicas share the consumer group and each request goes to
+# exactly one of them, so throughput can be raised by editing `replicas`.
+# ---------------------------------------------------------------------------

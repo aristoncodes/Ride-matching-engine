@@ -36,6 +36,22 @@ type RideRequest struct {
 	// client's. Used to measure queue latency and to expire requests a rider
 	// has long since given up on.
 	RequestedAt time.Time
+
+	// MatchAttempts counts how many batches have TRIED and failed to find this
+	// rider a driver.
+	//
+	// Deliberately separate from Message.Deliveries, and the distinction is a
+	// correctness one that a chaos test caught the hard way:
+	//
+	//	Deliveries    = infrastructure retries. "the consumer died holding this"
+	//	MatchAttempts = product outcome.       "we looked and there was no car"
+	//
+	// Both look identical to a broker — an un-acked message either way — so
+	// without this field a rider who simply cannot find a driver accumulates
+	// deliveries and is eventually dead-lettered AS POISON. That silently drops
+	// a real customer, which is exactly what the durability work exists to
+	// prevent. See Republish.
+	MatchAttempts int
 }
 
 // Message is a RideRequest plus its delivery metadata.
@@ -85,6 +101,19 @@ type Queue interface {
 	// and never delivered to anyone. Durability without reclaim is just a
 	// slower way to lose the request.
 	Reclaim(ctx context.Context, minIdle time.Duration, max int) ([]Message, error)
+
+	// Republish returns a request to the queue for a LATER window, with its
+	// match-attempt count incremented, and acks the original.
+	//
+	// This is how "we could not match you yet" is expressed, as distinct from
+	// "the consumer crashed". Leaving the message pending instead would work
+	// once and then accumulate delivery counts until the poison detector threw
+	// a perfectly valid rider away.
+	//
+	// Ordering is publish-then-ack, deliberately: a crash in between duplicates
+	// the request, which RequestID makes recoverable, whereas ack-then-publish
+	// would lose it outright.
+	Republish(ctx context.Context, msg Message) error
 
 	// DeadLetter moves a message aside permanently, with a reason.
 	// Acknowledged as part of the same operation, so a poison message cannot be

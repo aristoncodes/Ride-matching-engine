@@ -1,0 +1,143 @@
+# The C++ matching engine.
+#
+# This is the pod the Week 16 chaos test deletes. Everything about how it is
+# configured is aimed at one question: when it dies mid-batch, does the system
+# lose a ride request?
+#
+# The answer is supposed to be no, and the reason is architectural rather than
+# anything in this file: ADR-0002 put the engine in its own process so a crash
+# is an error value, and Week 12's batcher acks a request only AFTER it is
+# matched. A batch in flight when this pod dies is never acked, so it stays
+# pending in the Redis Stream and is redelivered. This manifest's job is to make
+# the pod come back quickly enough that the delay is invisible.
+apiVersion: v1
+kind: Service
+metadata:
+  name: matching-engine
+  namespace: ride-matching
+  labels:
+    app.kubernetes.io/name: matching-engine
+    app.kubernetes.io/part-of: ride-matching
+spec:
+  selector:
+    app.kubernetes.io/name: matching-engine
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: grpc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: matching-engine
+  namespace: ride-matching
+  labels:
+    app.kubernetes.io/name: matching-engine
+    app.kubernetes.io/part-of: ride-matching
+spec:
+  # Two replicas so the Service always has a healthy endpoint while one is
+  # being replaced. The engine is stateless per call (the graph is read-only
+  # after startup), so replicas are interchangeable — which is exactly what
+  # made ADR-0002's "scale the C++ tier as a worker pool" claim possible.
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0   # never drop below the desired count during a rollout
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: matching-engine
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: matching-engine
+        app.kubernetes.io/part-of: ride-matching
+    spec:
+      # Spread replicas across nodes where possible. `preferred` rather than
+      # `required` so a single-node cluster still schedules both instead of
+      # leaving one Pending forever — a required rule that cannot be satisfied
+      # is an outage disguised as a scheduling policy.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: matching-engine
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      volumes:
+        # Writable scratch, required because the root filesystem is read-only
+        # below. The road graph itself is baked into the image at /data (see
+        # matching_engine/Dockerfile); production would mount a PVC over it for
+        # anything larger than a city.
+        - name: tmp
+          emptyDir: {}
+      containers:
+        - name: engine
+          image: ride-matching/engine:dev
+          # Never pull: the image exists only in this cluster's local store,
+          # placed there by `kind load docker-image`. The default (Always for
+          # :latest-style tags) would send kubelet to Docker Hub for an image
+          # that was never pushed anywhere, and the pod would sit in
+          # ImagePullBackOff.
+          imagePullPolicy: Never
+          args:
+            - --port
+            - "50051"
+            - --graph
+            - blr-central=/data/bengaluru_roads.osm
+            - --max-riders
+            - "20000"
+            - --max-drivers
+            - "20000"
+          ports:
+            - name: grpc
+              containerPort: 50051
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              # A CPU limit throttles rather than kills, so exceeding it makes
+              # solves slower — which the batcher sees as a timeout and handles
+              # by requeueing. That is a much better failure mode than the OOM
+              # kill an under-set memory limit produces.
+              cpu: "2"
+              memory: 1Gi
+          startupProbe:
+            # SEPARATE from liveness, and this is the important one for a
+            # process with slow startup. The engine parses an OSM extract before
+            # it listens (~30 ms here, minutes for a country-sized graph).
+            # Without a startup probe you must set initialDelaySeconds on
+            # liveness to cover the worst case, which then delays detection of a
+            # real hang by the same amount. A startup probe decouples the two:
+            # generous while booting, strict once running.
+            tcpSocket:
+              port: grpc
+            periodSeconds: 2
+            failureThreshold: 30      # up to 60s to come up
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp

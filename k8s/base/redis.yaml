@@ -1,0 +1,129 @@
+# Redis: the ride-request queue (ADR-0006) and the live driver-location store
+# (ADR-0004).
+#
+# A StatefulSet, not a Deployment, and the distinction is load-bearing:
+# this Redis holds the durable queue. A Deployment gives pods random names and
+# treats their storage as interchangeable; a StatefulSet gives a stable identity
+# (redis-0) and binds it to the same PersistentVolumeClaim across restarts. If a
+# rescheduled Redis came back with an empty volume, every un-acked ride request
+# would be gone — the exact failure this whole phase exists to prevent.
+#
+# One replica, deliberately. Redis replication with automatic failover needs
+# Sentinel or Cluster, which is real operational surface and out of scope for
+# this week. The honest position: this is a single point of failure, mitigated
+# by AOF persistence, and Week 16's chaos test kills the ENGINE rather than
+# Redis for exactly that reason.
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: ride-matching
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/part-of: ride-matching
+spec:
+  # Headless (clusterIP: None) so redis-0 gets a stable DNS name,
+  # redis-0.redis.ride-matching.svc.cluster.local, rather than being load
+  # balanced. With one replica it makes little difference; with replication it
+  # is the difference between addressing a specific node and a random one.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: ride-matching
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/part-of: ride-matching
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis
+        app.kubernetes.io/part-of: ride-matching
+    spec:
+      # Beyond the grace period Kubernetes sends SIGKILL. Redis needs long
+      # enough to finish flushing its AOF buffer; cutting it short is how you
+      # lose the last second of writes on every rolling restart.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999          # the redis user in the official image
+        fsGroup: 999            # so the mounted volume is writable
+      containers:
+        - name: redis
+          image: redis:8.0.3-alpine
+          args:
+            - redis-server
+            # Same durability settings as docker-compose. ADR-0006 accepted
+            # Redis's in-memory nature as the cost of avoiding Kafka;
+            # appendfsync everysec is the mitigation it promised, bounding
+            # worst-case loss to about a second of ride requests.
+            - --appendonly
+            - "yes"
+            - --appendfsync
+            - everysec
+            - --dir
+            - /data
+            - --maxmemory
+            - 512mb
+            # noeviction is a CORRECTNESS setting here, not tuning. Any
+            # allkeys-* policy would silently evict ride requests under memory
+            # pressure. Failing writes loudly is the correct behaviour.
+            - --maxmemory-policy
+            - noeviction
+          ports:
+            - name: redis
+              containerPort: 6379
+          resources:
+            # requests = what the scheduler reserves; limits = the hard ceiling.
+            # Memory limit is set ABOVE maxmemory (512Mi) with headroom for
+            # Redis's own overhead and copy-on-write during AOF rewrite —
+            # setting them equal invites the OOM killer during a rewrite, which
+            # looks exactly like a crash.
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 768Mi
+          livenessProbe:
+            # Is the process wedged? Restart it if so.
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            # Should it receive traffic? Redis accepts TCP connections while
+            # still loading its AOF, so a port check would mark it ready far
+            # too early and every client's first command would fail.
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 2
+            periodSeconds: 3
+            timeoutSeconds: 3
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
