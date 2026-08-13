@@ -5,7 +5,7 @@
 //
 // An SLO written in a document drifts from the system within a month. Defined
 // beside the metric that measures it, the two cannot disagree — and the
-// alerting rules in docs/SLO_SLA.md are generated from these same names.
+// alerting rules in docs/Observability.md are written from these same names.
 //
 // # What is deliberately NOT measured
 //
