@@ -7,7 +7,8 @@ At the end you will have `https://api.yourdomain.com` serving real traffic, with
 TLS, authentication, and a firewall.
 
 **Time:** about 90 minutes, most of it waiting for DNS.
-**Cost:** roughly **$5–8/month** plus **$10–15/year** for the domain.
+**Cost:** roughly **$5–8/month** plus **$10–15/year** for the domain — or
+**nothing at all**, see the next section.
 
 ---
 
@@ -30,6 +31,100 @@ TLS, authentication, and a firewall.
 ```
 
 The security model in one line: **one door, and it is locked.**
+
+---
+
+## Doing this for $0
+
+Everything below can be done for nothing. Two routes, and they are good at
+different things.
+
+### Route A — a public URL in five minutes, no account, no card
+
+**[Cloudflare Quick Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/)**
+gives you a real `https://` URL that forwards to a port on your laptop. No
+signup, no domain, no server, TLS included, WebSockets supported.
+
+Three commands, start to finish:
+
+```bash
+# 1. Start the stack in tunnel mode. Note all THREE -f files: this layers on
+#    the production overlay, so authentication and the Redis password still
+#    apply. Tunnelling the DEV stack would put an unauthenticated API on the
+#    public internet.
+export REDIS_PASSWORD=$(openssl rand -base64 32)
+export RIDEMATCH_DOMAIN=unused ACME_EMAIL=unused@example.com   # not used here
+docker compose -f docker-compose.yml \
+               -f deploy/docker-compose.prod.yml \
+               -f deploy/docker-compose.tunnel.yml up -d --build
+
+# 2. Mint a key, and save what it prints
+docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml \
+               -f deploy/docker-compose.tunnel.yml \
+               run --rm keyadmin create --tenant demo --name "demo" --rate 600
+
+# 3. Open the tunnel
+brew install cloudflared                      # or your platform's package
+cloudflared tunnel --url http://localhost:8088
+# prints: https://something-random.trycloudflare.com
+```
+
+That URL is live on the internet immediately, with a valid certificate.
+`deploy/docker-compose.tunnel.yml` puts Caddy on a **loopback-only** port doing
+plain HTTP — Cloudflare terminates TLS at its edge, and a quick tunnel forwards
+only one port, so Caddy is what routes both the REST and WebSocket endpoints
+onto a single URL.
+
+Verified working end to end: 40 WebSocket drivers through the proxy with 679
+pings and zero failures, unauthenticated requests refused with 401, `/metrics`
+and `/debug/pprof` returning 404, and riders matched at `match_rate=1.00`.
+
+**This is arguably safer than the VM.** Nothing listens on a public interface at
+all — the tunnel dials *out* to Cloudflare, so there is no inbound port for
+anyone to scan or reach.
+
+**What you are trading away:** the URL is random and changes on every restart,
+the tunnel dies when your laptop sleeps, and there is no uptime of any kind. It
+is perfect for "let me show you this right now" and useless as a permanent
+home.
+
+### Route B — a permanent server, free forever
+
+**[Oracle Cloud Always Free](https://www.oracle.com/cloud/free/)** is the only
+free tier generous enough to actually run this: an Ampere **ARM** instance with
+up to **4 cores and 24 GB of RAM**, free indefinitely — far more than the €4.50
+Hetzner box. Pair it with a free **[DuckDNS](https://www.duckdns.org)**
+subdomain (`yourname.duckdns.org`) and the rest of this guide works unchanged.
+
+The images build on ARM without modification: `golang:1.26-bookworm` and
+`debian:bookworm-slim` are both multi-arch, and the C++ engine compiles from
+source anyway.
+
+**Read this before you commit to it:**
+
+- **A credit card is required for identity verification.** Always Free resources
+  are not charged, but the card must be on file. If that is a dealbreaker, take
+  Route A.
+- **ARM capacity is frequently exhausted.** "Out of host capacity" is the normal
+  experience, not a bug. Retry, or try a different availability domain. It can
+  take several attempts across a few days.
+- **Idle Always Free instances have been reclaimed** by Oracle in the past. Do
+  not put anything on it you cannot rebuild from this repository.
+- Free tiers carry no SLA whatsoever.
+
+DuckDNS specifically — rather than `nip.io` or `sslip.io` — because DuckDNS is on
+the Public Suffix List, so your subdomain gets its own Let's Encrypt rate-limit
+budget. On the shared-domain alternatives you inherit a budget that thousands of
+other people have usually already exhausted, and certificate issuance fails for
+reasons that have nothing to do with you.
+
+**Recommendation:** do Route A today, because it takes five minutes and proves
+the thing works publicly. Move to Route B when you want a URL that survives
+closing your laptop.
+
+The rest of this guide is the paid path (a domain you own plus a small VM),
+which is the most reliable and costs about $5–8/month. Every step applies to
+Route B too — only steps 1 and 2 change.
 
 ---
 
@@ -97,10 +192,15 @@ In your registrar's DNS panel, add one record:
 That creates `api.yourdomain.com`.
 
 > **Cloudflare users:** set the cloud icon to **DNS only (grey)**, not
-> "Proxied (orange)". Proxying breaks the ACME challenge Caddy uses, and
-> Cloudflare's free proxy also drops long-lived WebSockets after 100 seconds —
-> which would disconnect every driver, repeatedly, in a way that looks like a
-> bug in your code.
+> "Proxied (orange)", while you are getting the certificate — proxying
+> interferes with the HTTP-01 challenge Caddy uses.
+>
+> Cloudflare's proxy times out **idle** WebSockets at around 100 seconds, but
+> that does not affect this system: `ingestd` sends a heartbeat every 54
+> seconds (`PingInterval`, 90% of the 60-second `PongWait`), so a driver
+> connection is never idle for long enough. The heartbeat exists to detect dead
+> phones, and it happens to make the connection proxy-friendly as a side
+> effect.
 
 Check it has taken effect:
 

@@ -1,0 +1,34 @@
+# Free deployment: your laptop, exposed through a Cloudflare Quick Tunnel.
+#
+#   docker compose -f docker-compose.yml \
+#                  -f deploy/docker-compose.prod.yml \
+#                  -f deploy/docker-compose.tunnel.yml up -d --build
+#   cloudflared tunnel --url http://localhost:8088
+#
+# Applied ON TOP of the production overlay, so authentication, the Redis
+# password and the closed ports all still apply — this file changes only how
+# traffic arrives. Running the DEV stack through a public tunnel would put an
+# unauthenticated API on the internet, which is why this layers on prod rather
+# than replacing it.
+#
+# What differs from production:
+#
+#   - Caddy serves plain HTTP on a loopback-only port instead of holding a
+#     certificate. Cloudflare terminates TLS at its edge and the tunnel carries
+#     the traffic here encrypted, so there is nothing for Caddy to secure and
+#     no domain for it to be issued against.
+#
+#   - No ports 80/443. Nothing listens on a public interface at all; the tunnel
+#     dials OUT to Cloudflare. That is genuinely safer than the VM deployment —
+#     there is no inbound port for anyone to scan.
+
+services:
+  caddy:
+    # Loopback only. The tunnel reaches it from this machine; nothing else can,
+    # not even another device on your wifi.
+    ports: !override ["127.0.0.1:8088:80"]
+    volumes: !override
+      - ./deploy/Caddyfile.tunnel:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment: !reset {}

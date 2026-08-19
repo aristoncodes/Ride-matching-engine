@@ -1,0 +1,41 @@
+# Caddy for the free Cloudflare-tunnel deployment.
+#
+# Same routing as the main Caddyfile, with TLS removed: the tunnel terminates
+# HTTPS at Cloudflare's edge, and the hop from there to this machine runs
+# inside the tunnel's own encrypted connection. Caddy is still here because a
+# quick tunnel forwards exactly ONE port, and this system has two public
+# endpoints — so something has to route them onto a single URL.
+
+{
+	# Off, or Caddy tries to provision a certificate for a name it does not
+	# have and cannot validate. Cloudflare owns TLS in this setup.
+	auto_https off
+	admin off
+}
+
+:80 {
+	handle /v1/drivers/stream {
+		reverse_proxy ingestd:8080 {
+			flush_interval -1
+		}
+	}
+
+	handle /v1/ride-requests* {
+		request_body {
+			max_size 16KB
+		}
+		reverse_proxy requestd:8081
+	}
+
+	# Same omission as the production Caddyfile, for the same reason: /metrics,
+	# /debug/pprof and batcherd have no route here, so the tunnel cannot reach
+	# them however it is probed.
+	handle {
+		respond "not found" 404
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}
