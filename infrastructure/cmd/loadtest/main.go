@@ -59,12 +59,14 @@ func main() {
 		rate       = flag.Int("rate", 500, "ride requests per second (pipeline mode)")
 		pingEvery  = flag.Duration("ping-every", 3*time.Second, "driver ping interval")
 		out        = flag.String("out", "", "write a Markdown report to this path")
+		apiKey     = flag.String("key", os.Getenv("RIDEMATCH_API_KEY"),
+			"API key (or RIDEMATCH_API_KEY). Required unless the services run with --allow-anonymous")
 	)
 	flag.Parse()
 
 	switch *mode {
 	case "pipeline":
-		runPipeline(*wsURL, *restURL, *drivers, *riders, *rate, *pingEvery, *out)
+		runPipeline(*wsURL, *restURL, *apiKey, *drivers, *riders, *rate, *pingEvery, *out)
 	case "sweep":
 		runSweep(*engineAddr, *out)
 	default:
@@ -158,7 +160,7 @@ func round(d time.Duration) time.Duration {
 // Pipeline mode
 // ---------------------------------------------------------------------------
 
-func runPipeline(wsURL, restURL string, numDrivers, numRiders, rate int,
+func runPipeline(wsURL, restURL, apiKey string, numDrivers, numRiders, rate int,
 	pingEvery time.Duration, outPath string) {
 
 	fmt.Printf("=== pipeline load test ===\n")
@@ -186,7 +188,7 @@ func runPipeline(wsURL, restURL string, numDrivers, numRiders, rate int,
 			defer wg.Done()
 			dialSem <- struct{}{}
 			start := time.Now()
-			conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+			conn, resp, err := websocket.DefaultDialer.Dial(wsURL, authHeader(apiKey))
 			<-dialSem
 
 			if err != nil {
@@ -301,9 +303,19 @@ func runPipeline(wsURL, restURL string, numDrivers, numRiders, rate int,
 			defer submitWG.Done()
 			body := fmt.Sprintf(`{"rider_id":"R-%06d","pickup":{"lat":%f,"lng":%f}}`, i, lat, lng)
 
+			req, err := http.NewRequest(http.MethodPost, restURL+"/v1/ride-requests",
+				strings.NewReader(body))
+			if err != nil {
+				failed.Add(1)
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+			if apiKey != "" {
+				req.Header.Set("X-API-Key", apiKey)
+			}
+
 			start := time.Now()
-			resp, err := client.Post(restURL+"/v1/ride-requests",
-				"application/json", strings.NewReader(body))
+			resp, err := client.Do(req)
 			elapsed := time.Since(start)
 
 			if err != nil {
@@ -352,6 +364,15 @@ type sweepPoint struct {
 	Series             string // "N", "M" or "dense" — tagged explicitly
 	Riders, Drivers, K int
 	Solve              stats
+}
+
+// authHeader carries the key on the WebSocket handshake, or nothing at all
+// when the services are running anonymously.
+func authHeader(apiKey string) http.Header {
+	if apiKey == "" {
+		return nil
+	}
+	return http.Header{"X-API-Key": []string{apiKey}}
 }
 
 func runSweep(engineAddr string, outPath string) {

@@ -38,6 +38,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/aditya/ride-matching/internal/redisconn"
 )
 
 // ErrNotAcquired means another holder currently owns the lease.
@@ -117,6 +119,7 @@ func NewManager(addr string, opts Options) (*Manager, error) {
 	client := redis.NewClient(&redis.Options{
 		Network:      network,
 		Addr:         addr,
+		Password:     redisconn.Password(),
 		DialTimeout:  2 * time.Second,
 		ReadTimeout:  time.Second,
 		WriteTimeout: time.Second,

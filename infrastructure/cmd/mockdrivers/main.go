@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -37,7 +38,9 @@ type ping struct {
 
 func main() {
 	var (
-		url       = flag.String("url", "ws://localhost:8080/v1/drivers/stream", "ingestd WebSocket URL")
+		url    = flag.String("url", "ws://localhost:8080/v1/drivers/stream", "ingestd WebSocket URL")
+		apiKey = flag.String("key", os.Getenv("RIDEMATCH_API_KEY"),
+			"API key (or RIDEMATCH_API_KEY). Required unless ingestd runs with --allow-anonymous")
 		drivers   = flag.Int("drivers", 100, "number of simulated drivers")
 		interval  = flag.Duration("interval", 3*time.Second, "ping interval per driver")
 		duration  = flag.Duration("duration", 0, "stop after this long (0 = run until interrupted)")
@@ -67,7 +70,7 @@ func main() {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			runDriver(ctx, *url, id, *centreLat, *centreLng, *spreadKm, *interval,
+			runDriver(ctx, *url, *apiKey, id, *centreLat, *centreLng, *spreadKm, *interval,
 				&connected, &sent, &failed, &refused)
 		}(i)
 
@@ -101,7 +104,7 @@ func main() {
 		sent.Load(), failed.Load(), refused.Load())
 }
 
-func runDriver(ctx context.Context, url string, id int,
+func runDriver(ctx context.Context, url, apiKey string, id int,
 	centreLat, centreLng, spreadKm float64, interval time.Duration,
 	connected, sent, failed, refused *atomic.Int64) {
 
@@ -114,7 +117,15 @@ func runDriver(ctx context.Context, url string, id int,
 	lat := centreLat + (rng.Float64()-0.5)*2*spreadKm/kmPerDegree
 	lng := centreLng + (rng.Float64()-0.5)*2*spreadKm/kmPerDegree
 
-	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, url, nil)
+	// The key travels in a header, never in the query string: URLs end up in
+	// proxy logs, browser history and error reports, and a credential that
+	// leaks into a log is a credential you must rotate.
+	var hdr http.Header
+	if apiKey != "" {
+		hdr = http.Header{"X-API-Key": []string{apiKey}}
+	}
+
+	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, url, hdr)
 	if err != nil {
 		// A 503 is the server correctly enforcing its connection limit, which
 		// is a successful test of backpressure rather than a failure of this

@@ -18,10 +18,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/aditya/ride-matching/internal/adminserver"
+	"github.com/aditya/ride-matching/internal/authsetup"
 	"github.com/aditya/ride-matching/internal/ingest"
 	"github.com/aditya/ride-matching/internal/locations"
 	"github.com/aditya/ride-matching/internal/metrics"
@@ -39,6 +41,15 @@ func main() {
 		maxBuffered = flag.Int("max-buffered", 100000, "maximum distinct drivers buffered per window")
 		reapEvery   = flag.Duration("reap-every", 30*time.Second, "how often to delete stale drivers")
 	)
+	// Note the polarity: authentication is ON unless explicitly disabled. See
+	// internal/authsetup for why the flag is not --auth.
+	allowAnonymous := flag.Bool("allow-anonymous", false,
+		"DISABLE API-key authentication (local development only; every driver "+
+			"becomes --tenant and no rate limits apply)")
+	allowedOrigins := flag.String("allowed-origins", "",
+		"comma-separated Origins permitted to open a driver stream from a browser. "+
+			"Empty (the default) rejects every browser origin; native driver apps "+
+			"send no Origin header and are unaffected")
 	adminAddr := flag.String("admin-addr", ":6060",
 		"admin/pprof listen address (NEVER expose this publicly)")
 	contentionProfile := flag.Bool("contention-profile", false,
@@ -133,8 +144,23 @@ func main() {
 		}
 	})
 
+	keys, closeKeys, err := authsetup.Open(context.Background(), *redisAddr, *allowAnonymous, logger)
+	if err != nil {
+		logger.Error("authentication setup failed", "err", err)
+		os.Exit(1)
+	}
+	defer closeKeys()
+
+	var origins []string
+	if *allowedOrigins != "" {
+		origins = strings.Split(*allowedOrigins, ",")
+	}
+
 	wsServer := ingest.NewServer(pipe, ingest.Config{
 		MaxConnections: *maxConns,
+		Keys:           keys,
+		TenantID:       *tenant,
+		AllowedOrigins: origins,
 		Logger:         logger,
 	})
 

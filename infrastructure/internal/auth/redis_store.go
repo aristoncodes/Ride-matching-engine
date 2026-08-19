@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/aditya/ride-matching/internal/redisconn"
 )
 
 // RedisStore persists API keys and enforces rate limits in Redis.
@@ -38,6 +40,7 @@ func NewRedisStore(addr string, now func() time.Time) (*RedisStore, error) {
 		client: redis.NewClient(&redis.Options{
 			Network:      network,
 			Addr:         addr,
+			Password:     redisconn.Password(),
 			DialTimeout:  2 * time.Second,
 			ReadTimeout:  time.Second,
 			WriteTimeout: time.Second,

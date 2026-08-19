@@ -1,0 +1,75 @@
+# Caddy is the only process with a public port.
+#
+# It is here for one reason that matters and several that are convenient. The
+# one that matters: API keys travel on every request and every WebSocket
+# handshake, so plaintext HTTP would hand every driver's credential to anyone
+# on the path. Caddy obtains and renews a Let's Encrypt certificate on its own,
+# which is the difference between "TLS is set up" and "TLS is still set up in
+# ninety days".
+
+{
+	email {$ACME_EMAIL}
+
+	# Every public response, including errors, drops the server banner. Version
+	# numbers are how an attacker picks which exploit to try first.
+	servers {
+		protocols h1 h2 h3
+	}
+}
+
+{$RIDEMATCH_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		# HSTS: after the first visit, browsers refuse plaintext to this host
+		# for a year. Only safe once HTTPS definitely works — which is why it
+		# is set here rather than while you are still testing DNS.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# ---- Driver GPS streams -------------------------------------------------
+	# reverse_proxy handles the WebSocket upgrade natively; no special config is
+	# needed for it. What IS needed is the absence of a response timeout, since
+	# a driver stream is meant to stay open for hours.
+	handle /v1/drivers/stream {
+		reverse_proxy ingestd:8080 {
+			flush_interval -1
+		}
+	}
+
+	# ---- Rider ride requests ------------------------------------------------
+	handle /v1/ride-requests* {
+		# A ride request is ~150 bytes. The service caps the body itself, but
+		# capping it at the edge too means a multi-gigabyte upload is refused
+		# before it ever occupies an application goroutine.
+		request_body {
+			max_size 16KB
+		}
+		reverse_proxy requestd:8081 {
+			health_uri /readyz
+		}
+	}
+
+	# ---- Everything else ----------------------------------------------------
+	# Note what is NOT routed: /metrics, /debug/pprof, /stats, and batcherd
+	# entirely. Those live on admin ports that this file has no route to and
+	# that the production compose overlay does not publish, so they are
+	# unreachable from the internet by construction rather than by a deny rule
+	# someone can forget to update.
+	handle {
+		respond "not found" 404
+	}
+
+	log {
+		output stdout
+		format json
+		# The Authorization and X-API-Key headers are NOT logged. Caddy does not
+		# log request headers by default — this comment exists so that nobody
+		# "improves" the logging later and quietly starts writing live
+		# credentials to disk.
+	}
+}

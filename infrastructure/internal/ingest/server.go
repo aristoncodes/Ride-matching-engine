@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -91,6 +92,16 @@ type Config struct {
 	// Keys enables API-key authentication on the upgrade (Week 18). Nil
 	// disables auth, which is fine for local development and is logged loudly.
 	Keys auth.Store
+
+	// AllowedOrigins lists the browser Origins permitted to open a driver
+	// stream. Empty — the default — rejects every request that carries an
+	// Origin header at all.
+	//
+	// That default is safe rather than strict, because the real driver client
+	// is a native app and native apps send no Origin. Only a browser sets it,
+	// and a browser opening a driver stream is either your own dashboard (add
+	// it here explicitly) or someone else's page riding a user's credentials.
+	AllowedOrigins []string
 
 	// TenantID is the fallback when Keys is nil.
 	TenantID string
@@ -197,6 +208,37 @@ func (s *Server) admit() bool {
 	return true
 }
 
+// originChecker builds the upgrader's Origin policy.
+//
+// The rule has two halves, and the first is the one that surprises people:
+//
+//   - No Origin header at all → ALLOW. Native apps, CLI tools and the mock
+//     driver do not send one; only browsers do. Rejecting a missing Origin
+//     would break every real driver client while stopping no attack, since
+//     anything that can omit a header can also forge one.
+//   - An Origin present → it must be on the allowlist. This is the case
+//     CheckOrigin exists for: a page on evil.com opening a socket to us in a
+//     logged-in user's browser.
+//
+// So the Origin check defends browsers specifically. Authentication is what
+// defends everything, which is why this is a second line rather than the first.
+func originChecker(allowed []string) func(*http.Request) bool {
+	set := make(map[string]struct{}, len(allowed))
+	for _, o := range allowed {
+		if o = strings.TrimSpace(o); o != "" {
+			set[o] = struct{}{}
+		}
+	}
+	return func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true
+		}
+		_, ok := set[origin]
+		return ok
+	}
+}
+
 // NewServer creates a server. It does not listen; mount Handler() on a mux.
 func NewServer(sink Sink, cfg Config) *Server {
 	cfg.applyDefaults()
@@ -207,12 +249,12 @@ func NewServer(sink Sink, cfg Config) *Server {
 			HandshakeTimeout: 10 * time.Second,
 			ReadBufferSize:   1024,
 			WriteBufferSize:  1024,
-			// Origin checking is deliberately permissive here and MUST be
-			// tightened before this is exposed publicly. Drivers connect from a
-			// native app with an API key (Week 18), not from a browser, so the
-			// real defence is authentication rather than the Origin header —
-			// but leaving this unremarked is how it silently ships.
-			CheckOrigin: func(r *http.Request) bool { return true },
+			// WebSockets are NOT protected by the same-origin policy: a browser
+			// will happily open a cross-origin ws:// connection and attach the
+			// user's cookies, with no CORS preflight to stop it. CheckOrigin is
+			// the only place that check can happen, and gorilla's default —
+			// which this used to be — accepts everything.
+			CheckOrigin: originChecker(cfg.AllowedOrigins),
 		},
 		shutdown: make(chan struct{}),
 	}

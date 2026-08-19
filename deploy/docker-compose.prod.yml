@@ -1,0 +1,161 @@
+# Production overlay. Apply it ON TOP of the base stack:
+#
+#   docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml up -d
+#
+# An overlay rather than a second full stack, so there is exactly one definition
+# of what a service IS and this file only records how production differs. Two
+# complete files drift, and the drift is always discovered during an incident.
+#
+# What it changes, and why each one matters:
+#
+#   1. Authentication ON. The base file passes --allow-anonymous for the
+#      quickstart; the commands below simply omit it. Note that the flag has to
+#      be removed by restating the whole command — Compose REPLACES a list, it
+#      does not merge it, which here is a feature: the production command line
+#      is visible in full rather than assembled from two files in your head.
+#
+#   2. Nothing is published to the host except Caddy. In the base file Redis,
+#      the engine and all three services bind host ports, which on a public VM
+#      would mean an open Redis on the internet.
+#
+#      Note `!reset []` and NOT `ports: []`. Compose MERGES lists across
+#      overlay files by appending, so an empty list changes nothing at all —
+#      the first version of this file looked like it closed every port and
+#      `docker compose config` showed all five still published. `!reset` is
+#      the only thing that actually clears an inherited list.
+#
+#      ALWAYS diff `docker compose config` against what you intended. An
+#      overlay that silently did nothing is indistinguishable from one that
+#      worked, right up until the scan finds you.
+#
+#   3. TLS terminates at Caddy, which obtains and renews a certificate
+#      automatically. API keys cross the network on every request, so plaintext
+#      HTTP would leak every driver's credential to anyone on the path.
+
+services:
+  # ---------------------------------------------------------------------------
+  # The only container with a public port.
+  # ---------------------------------------------------------------------------
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"     # required: ACME HTTP-01 challenge and the HTTPS redirect
+      - "443:443"
+      - "443:443/udp"  # HTTP/3
+    environment:
+      RIDEMATCH_DOMAIN: ${RIDEMATCH_DOMAIN:?set RIDEMATCH_DOMAIN, e.g. api.example.com}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL for certificate expiry notices}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Named volumes, not bind mounts: these hold the issued certificates and
+      # the ACME account key. Losing them means re-issuing on every restart,
+      # and Let's Encrypt rate-limits that to 5 duplicate certificates per week
+      # — which is how a restart loop locks you out of your own domain.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      ingestd:
+        condition: service_healthy
+      requestd:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  redis:
+    ports: !reset []
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --dir
+      - /data
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-512mb}
+      # noeviction, deliberately. Redis holds the durable ride-request queue AND
+      # the API keys here, so evicting under memory pressure would silently drop
+      # ride requests — exactly the tenet the Week 16 chaos test exists to
+      # defend. Refusing writes is a loud failure; eviction is a quiet one.
+      - --maxmemory-policy
+      - noeviction
+      # A password even though the port is not published. Defence in depth: one
+      # misconfigured compose file or one container escape should not be enough
+      # to reach an unauthenticated database holding your credentials.
+      - --requirepass
+      - ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+
+  # ---------------------------------------------------------------------------
+  matching-engine:
+    ports: !reset []
+
+  # ---------------------------------------------------------------------------
+  ingestd:
+    ports: !reset []
+    command:
+      - --addr=:8080
+      - --redis=redis:6379
+      - --tenant=${TENANT_ID:-default}
+      - --window=${BATCH_WINDOW:-3s}
+      - --ttl=${DRIVER_TTL:-30s}
+      - --max-conns=${MAX_CONNS:-20000}
+      # No --allow-anonymous. That omission IS the security control.
+      #
+      # --allowed-origins stays empty unless you have a browser dashboard:
+      # native driver apps send no Origin header and are unaffected.
+      - --allowed-origins=${ALLOWED_ORIGINS:-}
+    environment:
+      # By environment, never on the command line: argv is readable via `ps`
+      # by any user on the host and is captured in `docker inspect`.
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+
+  # ---------------------------------------------------------------------------
+  requestd:
+    ports: !reset []
+    command:
+      - --addr=:8081
+      - --redis=redis:6379
+      - --tenant=${TENANT_ID:-default}
+    environment:
+      # By environment, never on the command line: argv is readable via `ps`
+      # by any user on the host and is captured in `docker inspect`.
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+
+  # ---------------------------------------------------------------------------
+  # batcherd is internal: it consumes the queue and talks to the engine. It has
+  # no public surface, so it is not proxied and publishes nothing.
+  batcherd:
+    ports: !reset []
+    environment:
+      # By environment, never on the command line: argv is readable via `ps`
+      # by any user on the host and is captured in `docker inspect`.
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+
+  # ---------------------------------------------------------------------------
+  # Operator tooling, not a running service.
+  #
+  # `profiles` keeps it out of `up`: it starts only when named explicitly, so
+  # there is no idle container and no extra attack surface. Run it with
+  #
+  #   docker compose ... run --rm keyadmin create --tenant acme --name "acme prod"
+  #
+  # It needs the Redis password like everything else, and it reaches Redis over
+  # the compose network — no port has to be opened to mint a key.
+  keyadmin:
+    build:
+      context: .
+      dockerfile: infrastructure/Dockerfile
+      args:
+        SERVICE: keyadmin
+    image: ride-matching/keyadmin:${TAG:-dev}
+    profiles: ["tools"]
+    environment:
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  caddy_data:
+  caddy_config:

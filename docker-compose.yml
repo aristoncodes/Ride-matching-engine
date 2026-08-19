@@ -42,7 +42,7 @@ services:
       - --maxmemory-policy
       - noeviction
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "${BIND_ADDR:-127.0.0.1}:${REDIS_PORT:-6379}:6379"
     volumes:
       - redis-data:/data
     healthcheck:
@@ -82,7 +82,7 @@ services:
     volumes:
       - ./matching_engine/data:/data:ro
     ports:
-      - "${ENGINE_PORT:-50051}:50051"
+      - "${BIND_ADDR:-127.0.0.1}:${ENGINE_PORT:-50051}:50051"
     healthcheck:
       test: ["CMD-SHELL", "timeout 2 bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/50051'"]
       interval: 5s
@@ -108,8 +108,13 @@ services:
       - --tenant=${TENANT_ID:-default}
       - --window=${BATCH_WINDOW:-3s}
       - --ttl=${DRIVER_TTL:-30s}
+      # THIS FILE IS THE DEVELOPMENT STACK. Authentication is off so the
+      # README quickstart works with no key setup, and every client is
+      # ${TENANT_ID}. deploy/docker-compose.prod.yml drops this flag, which is
+      # what turns auth on — see deploy/Deploying.md.
+      - --allow-anonymous
     ports:
-      - "${INGEST_PORT:-8080}:8080"
+      - "${BIND_ADDR:-127.0.0.1}:${INGEST_PORT:-8080}:8080"
     depends_on:
       redis:
         # NOT just `depends_on: [redis]`, which only waits for the container to
@@ -136,8 +141,10 @@ services:
       - --addr=:8081
       - --redis=redis:6379
       - --tenant=${TENANT_ID:-default}
+      # Development only. See the note on ingestd above.
+      - --allow-anonymous
     ports:
-      - "${REQUEST_PORT:-8081}:8081"
+      - "${BIND_ADDR:-127.0.0.1}:${REQUEST_PORT:-8081}:8081"
     depends_on:
       redis:
         condition: service_healthy
@@ -169,7 +176,7 @@ services:
       - --max-batch=${MAX_BATCH:-500}
       - --candidates=${CANDIDATES_PER_RIDER:-8}
     ports:
-      - "${BATCHER_PORT:-8082}:8082"
+      - "${BIND_ADDR:-127.0.0.1}:${BATCHER_PORT:-8082}:8082"
     depends_on:
       redis:
         condition: service_healthy

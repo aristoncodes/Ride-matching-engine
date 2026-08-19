@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/aditya/ride-matching/internal/redisconn"
 )
 
 // RedisStream implements Queue on Redis Streams (ADR-0006).
@@ -105,6 +107,7 @@ func NewRedisStream(addr string, opts StreamOptions) (*RedisStream, error) {
 	client := redis.NewClient(&redis.Options{
 		Network:      network,
 		Addr:         addr,
+		Password:     redisconn.Password(),
 		DialTimeout:  2 * time.Second,
 		WriteTimeout: 2 * time.Second,
 		// Deliberately 0 = no read timeout. XREADGROUP with BLOCK holds the

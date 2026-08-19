@@ -25,6 +25,7 @@ import (
 
 	"github.com/aditya/ride-matching/internal/adminserver"
 	"github.com/aditya/ride-matching/internal/api"
+	"github.com/aditya/ride-matching/internal/authsetup"
 	"github.com/aditya/ride-matching/internal/metrics"
 	"github.com/aditya/ride-matching/internal/queue"
 )
@@ -36,6 +37,11 @@ func main() {
 		tenant    = flag.String("tenant", "default", "tenant id")
 		maxLen    = flag.Int64("stream-maxlen", 1_000_000, "max ride requests retained in the stream")
 	)
+	// Note the polarity: authentication is ON unless explicitly disabled. See
+	// internal/authsetup for why the flag is not --auth.
+	allowAnonymous := flag.Bool("allow-anonymous", false,
+		"DISABLE API-key authentication (local development only; every caller "+
+			"becomes --tenant and no rate limits apply)")
 	adminAddr := flag.String("admin-addr", ":6061",
 		"admin/pprof listen address (NEVER expose this publicly)")
 	contentionProfile := flag.Bool("contention-profile", false,
@@ -93,8 +99,16 @@ func main() {
 	}
 	cancelPing()
 
+	keys, closeKeys, err := authsetup.Open(context.Background(), *redisAddr, *allowAnonymous, logger)
+	if err != nil {
+		logger.Error("authentication setup failed", "err", err)
+		os.Exit(1)
+	}
+	defer closeKeys()
+
 	cfg := api.DefaultConfig()
 	cfg.TenantID = *tenant
+	cfg.Keys = keys
 	cfg.Logger = logger
 
 	srv, err := api.NewServer(q, cfg)

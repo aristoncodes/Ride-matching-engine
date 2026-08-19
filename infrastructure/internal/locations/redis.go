@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/aditya/ride-matching/internal/redisconn"
 )
 
 // RedisRepository stores live driver locations in Redis.
@@ -91,6 +93,7 @@ func NewRedis(addr string, opts Options) (*RedisRepository, error) {
 	client := redis.NewClient(&redis.Options{
 		Network:  network,
 		Addr:     addr,
+		Password: redisconn.Password(),
 		PoolSize: opts.PoolSize,
 
 		// go-redis retries internally too, but only for connection setup. The
