@@ -60,8 +60,9 @@ func main() {
 		pingEvery  = flag.Duration("ping-every", 3*time.Second, "driver ping interval")
 		regionFlag = flag.String("region", "centre",
 			"geographic profile: centre (0.09/0.18-degree box, default) | bengaluru (city-wide, demand-weighted riders)")
-		out    = flag.String("out", "", "write a Markdown report to this path")
-		apiKey = flag.String("key", os.Getenv("RIDEMATCH_API_KEY"),
+		dialRate = flag.Int("dial-rate", 200, "driver dials started per second (pipeline mode)")
+		out      = flag.String("out", "", "write a Markdown report to this path")
+		apiKey   = flag.String("key", os.Getenv("RIDEMATCH_API_KEY"),
 			"API key (or RIDEMATCH_API_KEY). Required unless the services run with --allow-anonymous")
 	)
 	flag.Parse()
@@ -74,7 +75,7 @@ func main() {
 
 	switch *mode {
 	case "pipeline":
-		runPipeline(*wsURL, *restURL, *apiKey, *drivers, *riders, *rate, *pingEvery, *out, reg)
+		runPipeline(*wsURL, *restURL, *apiKey, *drivers, *riders, *rate, *pingEvery, *out, reg, *dialRate)
 	case "sweep":
 		runSweep(*engineAddr, *out, reg)
 	default:
@@ -169,7 +170,7 @@ func round(d time.Duration) time.Duration {
 // ---------------------------------------------------------------------------
 
 func runPipeline(wsURL, restURL, apiKey string, numDrivers, numRiders, rate int,
-	pingEvery time.Duration, outPath string, reg region) {
+	pingEvery time.Duration, outPath string, reg region, dialRate int) {
 
 	fmt.Printf("=== pipeline load test ===\n")
 	fmt.Printf("drivers=%d  riders=%d  rate=%d/s  ping=%v  region=%s\n\n", numDrivers, numRiders, rate, pingEvery, reg)
@@ -177,7 +178,8 @@ func runPipeline(wsURL, restURL, apiKey string, numDrivers, numRiders, rate int,
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var connected, connectFailed, refused atomic.Int64
+	var connected, connectFailed, refused, dialRetries atomic.Int64
+	dialErrs := newErrBuckets(apiKey)
 	connectLatency := &recorder{}
 
 	// ---- Ramp drivers ----------------------------------------------------
@@ -190,19 +192,40 @@ func runPipeline(wsURL, restURL, apiKey string, numDrivers, numRiders, rate int,
 	// exhausts ephemeral ports.
 	dialSem := make(chan struct{}, 200)
 
+	if dialRate < 1 {
+		dialRate = 1
+	}
+	dialTick := time.NewTicker(time.Second / time.Duration(dialRate))
+	defer dialTick.Stop()
+	backoffs := []time.Duration{100 * time.Millisecond, 300 * time.Millisecond, 900 * time.Millisecond}
+
 	for i := 0; i < numDrivers; i++ {
+		<-dialTick.C // ramp: spread driver starts at dialRate per second
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			dialSem <- struct{}{}
 			start := time.Now()
-			conn, resp, err := websocket.DefaultDialer.Dial(wsURL, authHeader(apiKey))
-			<-dialSem
+			var conn *websocket.Conn
+			var resp *http.Response
+			var err error
+			for attempt := 0; ; attempt++ {
+				dialSem <- struct{}{}
+				conn, resp, err = websocket.DefaultDialer.Dial(wsURL, authHeader(apiKey))
+				<-dialSem
+				if err == nil || (resp != nil && resp.StatusCode == http.StatusServiceUnavailable) ||
+					attempt >= len(backoffs) {
+					break
+				}
+				dialErrs.add(err)
+				dialRetries.Add(1)
+				time.Sleep(backoffs[attempt])
+			}
 
 			if err != nil {
 				if resp != nil && resp.StatusCode == http.StatusServiceUnavailable {
 					refused.Add(1) // the server correctly enforcing its limit
 				} else {
+					dialErrs.add(err)
 					connectFailed.Add(1)
 				}
 				return
@@ -269,6 +292,8 @@ func runPipeline(wsURL, restURL, apiKey string, numDrivers, numRiders, rate int,
 
 	fmt.Printf("  connected=%d failed=%d refused=%d in %v\n",
 		connected.Load(), connectFailed.Load(), refused.Load(), rampDuration.Round(time.Millisecond))
+	dialErrs.print(5)
+	fmt.Printf("  dial retries=%d\n", dialRetries.Load())
 	fmt.Printf("  connect latency: %s\n\n", connectLatency.stats())
 
 	// Let a couple of ping cycles land so the driver pool is populated before
