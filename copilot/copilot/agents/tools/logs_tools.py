@@ -11,17 +11,17 @@ ROW_LIMIT = 200
 
 LOG_QUERIES: dict[str, str] = {
     "errors_by_service": (
-        "SELECT ts, service, level, request_id, event, error FROM logs "
+        "SELECT id, ts, service, level, request_id, event, error FROM logs "
         # slog writes levels in uppercase (ERROR), so compare case-insensitively.
         "WHERE upper(level) IN ('ERROR', 'FATAL') AND ts >= now() - make_interval(mins => $1) "
         "ORDER BY ts DESC LIMIT 200"
     ),
     "trace_request": (
-        "SELECT ts, service, level, request_id, event, error FROM logs "
+        "SELECT id, ts, service, level, request_id, event, error FROM logs "
         "WHERE request_id = $1 ORDER BY ts ASC LIMIT 200"
     ),
     "recent_events_by_service": (
-        "SELECT ts, service, level, request_id, event, error FROM logs "
+        "SELECT id, ts, service, level, request_id, event, error FROM logs "
         "WHERE service = $1 AND ts >= now() - make_interval(mins => $2) "
         "ORDER BY ts DESC LIMIT 200"
     ),

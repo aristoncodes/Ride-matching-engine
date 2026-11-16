@@ -93,6 +93,8 @@ class _Specialist:
         self.ctx = ctx
         self.trace = trace
         self.anchors: set[str] = set()
+        self.metric_values: dict[str, list[float]] = {}  # "name@15m" -> returned values
+        self.log_ids: set[str] = set()
         self.raw_results: list[Any] = []
         self.unavailable = False
 
@@ -110,19 +112,22 @@ class _Specialist:
     async def _run_tool(self, name: str, args: dict) -> Any:
         c = self.ctx
         if self.role == "metrics" and name == "query_metric":
-            return await query_metric(
-                c["prom_client"],
-                c["prom_base_url"],
-                args.get("name"),
-                args.get("window_minutes", 15),
-            )
+            window = args.get("window_minutes", 15)
+            pts = await query_metric(c["prom_client"], c["prom_base_url"], args.get("name"), window)
+            vals = [float(p["value"]) for p in pts if isinstance(p, dict) and "value" in p]
+            self.metric_values.setdefault(f"{args.get('name')}@{window}m", []).extend(vals)
+            return pts
         if self.role == "logs" and name == "query_logs":
-            return await query_logs(c["pool_ro"], args.get("name"), args.get("params", {}))
+            rows = await query_logs(c["pool_ro"], args.get("name"), args.get("params", {}))
+            self.log_ids.update(str(r["id"]) for r in rows if r.get("id") is not None)
+            return rows
         if self.role == "runbook" and name == "search_runbook":
             rows = await search_runbook(
                 c["pool_ro"], c["embedder"], args.get("query"), args.get("k", 5)
             )
             for r in rows:
+                if not r.get("anchor"):
+                    continue  # chunks without an anchor cannot be cited
                 self.anchors.add(f"{r['source_file']}#{r['anchor']}")
             return rows
         raise ValueError(f"unknown tool {name!r} for {self.role}")
@@ -163,25 +168,62 @@ class _Specialist:
             user += f"\n\nTool result for {name}:\n{_dump(result)}"
         return self._evidence(final)
 
+    def _grounded(self, it: dict) -> str | None:
+        """Return None if the item is grounded in this run's tool results, else the drop reason."""
+        kind, ref, excerpt = it.get("kind"), it.get("ref"), it.get("excerpt")
+        if not isinstance(ref, str) or not isinstance(excerpt, str):
+            return "bad ref or excerpt"
+        if self.role == "metrics":
+            if kind != "metric":
+                return "wrong kind"
+            if ref not in self.metric_values:
+                return "metric not queried successfully"
+            if not any(_has_number(excerpt, v) for v in self.metric_values[ref]):
+                return "excerpt lacks a returned value"
+        elif self.role == "logs":
+            if kind != "log":
+                return "wrong kind"
+            if ref not in self.log_ids:
+                return "log id not returned"
+        else:
+            if kind != "doc":
+                return "wrong kind"
+            if ref not in self.anchors:
+                return "anchor not returned"
+        return None
+
     def _evidence(self, final: Any) -> list[Evidence]:
         items: list[Any] = []
-        if isinstance(final, list):
-            items = final
-        elif isinstance(final, dict):
-            ev = final.get("evidence")
+        if self.role == "runbook":
+            # Binding shape: {"evidence": [...], "best_anchor": str | null}
+            ev = final.get("evidence") if isinstance(final, dict) else None
             items = ev if isinstance(ev, list) else []
+        elif isinstance(final, list):
+            items = final
+        elif isinstance(final, dict) and isinstance(final.get("evidence"), list):
+            items = final["evidence"]
         out: list[Evidence] = []
-        for i, it in enumerate(items, 1):
+        for it in items:
             if not isinstance(it, dict):
                 continue
-            it = {**it, "id": f"E{i}"}  # local numbering; renumbered globally on merge
-            if isinstance(it.get("excerpt"), str):
-                it["excerpt"] = it["excerpt"][:500]
+            reason = self._grounded(it)
+            if reason is not None:
+                log.debug("dropped %s evidence: %s", self.role, reason)
+                continue
+            it = {**it, "id": f"E{len(out) + 1}"}  # local numbering; renumbered globally on merge
+            it["excerpt"] = it["excerpt"][:500]
             try:
                 out.append(Evidence.model_validate(it))
             except ValidationError:
-                continue
+                log.debug("dropped %s evidence: invalid", self.role)
         return out
+
+
+def _has_number(excerpt: str, value: float) -> bool:
+    forms = {repr(value), f"{value:g}", f"{value:.6g}"}
+    if value == int(value):
+        forms.add(str(int(value)))
+    return any(re.search(r"(?<![\d.])" + re.escape(f) + r"(?![\d])", excerpt) for f in forms)
 
 
 def _merge(per_role: dict[str, list[Evidence]]) -> list[Evidence]:
@@ -203,6 +245,7 @@ def _finalize(d: Diagnosis, evidence: list[Evidence], anchors: set[str]) -> Diag
         update["runbook_anchor"] = None
     if d.confidence < CONFIDENCE_FLOOR:
         update["needs_human"] = True
+    if update.get("needs_human", d.needs_human):
         update["proposed_action"] = ProposedAction(kind="none", deployment="none")
     return d.model_copy(update=update)
 
@@ -232,8 +275,34 @@ async def investigate(
     trace: list[dict] = []
     task = "Investigate this alert or question:\n" + json.dumps(alert_or_question, default=str)
     specialists = {r: _Specialist(r, ctx, trace) for r in ROLES}
-    results = await asyncio.gather(*(s.run(task, model) for s in specialists.values()))
-    per_role = dict(zip(ROLES, results, strict=True))
+    per_role: dict[str, list[Evidence]] = {}  # shared; filled as each specialist finishes
+
+    async def _specialist(role: str) -> None:
+        per_role[role] = await specialists[role].run(task, model)
+
+    async def _work() -> InvestigationResult:
+        await asyncio.gather(*(_specialist(r) for r in ROLES))
+        return await _coordinate(
+            task, per_role, specialists, model, trace, max_rounds=max_rounds, critic=critic
+        )
+
+    try:
+        return await _work()
+    except asyncio.CancelledError:
+        # Overall deadline hit: hand back what the specialists had finished.
+        return InvestigationResult(None, _merge(per_role), trace, critic_enabled=critic)
+
+
+async def _coordinate(
+    task: str,
+    per_role: dict[str, list[Evidence]],
+    specialists: dict[str, _Specialist],
+    model: GuardedModel,
+    trace: list[dict],
+    *,
+    max_rounds: int,
+    critic: bool,
+) -> InvestigationResult:
     evidence = _merge(per_role)
     anchors = set().union(*(s.anchors for s in specialists.values()))
 

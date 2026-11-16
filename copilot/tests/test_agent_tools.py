@@ -116,14 +116,16 @@ def test_log_sql_is_constant_and_parameterised():
         assert "$1" in sql
         assert "{" not in sql and "}" not in sql
         assert "LIMIT 200" in sql
+        assert sql.startswith("SELECT id, ts,")  # logs primary key, used as the evidence ref
     assert logs_tools.ROW_LIMIT == 200
 
 
 @pytest.mark.asyncio
 async def test_logs_happy_path_passes_params_positionally():
-    pool = FakePool([{"ts": 1, "service": "ingestd"}])
+    pool = FakePool([{"id": 9, "ts": 1, "service": "ingestd"}])
     out = await query_logs(pool, "recent_events_by_service", {"service": "ingestd", "minutes": 7})
-    assert out == [{"ts": 1, "service": "ingestd"}]
+    assert out == [{"id": 9, "ts": 1, "service": "ingestd"}]
+    assert out[0]["id"] == 9
     sql, args = pool.calls[0]
     assert sql == LOG_QUERIES["recent_events_by_service"]
     assert args == ("ingestd", 7)
@@ -141,8 +143,13 @@ async def test_runbook_k_bounds():
 @pytest.mark.asyncio
 async def test_runbook_search_sql_and_output():
     rows = [
-        {"source_file": "docs/Runbook.md", "anchor": "a", "heading": "H", "content": "c",
-         "score": 0.75}
+        {
+            "source_file": "docs/Runbook.md",
+            "anchor": "a",
+            "heading": "H",
+            "content": "c",
+            "score": 0.75,
+        }
     ]
     pool = FakePool(rows)
     out = await search_runbook(pool, FakeEmbedder(), "queue stuck", 3)
@@ -154,8 +161,13 @@ async def test_runbook_search_sql_and_output():
     assert args[1] == 3
     assert args[0].startswith("[") and len(args[0].strip("[]").split(",")) == 8
     assert out == [
-        {"source_file": "docs/Runbook.md", "anchor": "a", "heading": "H", "content": "c",
-         "score": 0.75}
+        {
+            "source_file": "docs/Runbook.md",
+            "anchor": "a",
+            "heading": "H",
+            "content": "c",
+            "score": 0.75,
+        }
     ]
     assert runbook_tools.SEARCH_SQL == sql
     assert metrics_tools.STEP_SECONDS == 15

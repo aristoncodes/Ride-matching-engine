@@ -53,7 +53,8 @@ CREATE TABLE IF NOT EXISTS incidents_seen (
   tokens_in    integer NOT NULL DEFAULT 0,
   tokens_out   integer NOT NULL DEFAULT 0,
   cost_usd     numeric(10,6) NOT NULL DEFAULT 0,
-  latency_ms   integer
+  latency_ms   integer,
+  trace        jsonb                    -- InvestigationResult.trace: per-step agent/tool/ms
 );
 
 -- AC-3: every action transition records who and when.
@@ -71,3 +72,6 @@ CREATE TABLE IF NOT EXISTS actions (
   executed_at  timestamptz,
   result       text
 );
+
+-- Existing databases: CREATE TABLE IF NOT EXISTS does not add columns.
+ALTER TABLE incidents_seen ADD COLUMN IF NOT EXISTS trace jsonb;

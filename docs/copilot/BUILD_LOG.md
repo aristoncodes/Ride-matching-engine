@@ -197,6 +197,32 @@ Commits: `d74969c` (tools 2.1, actions 2.5, RBAC 2.6, model guard 2.7) and `d92d
 
 **Still open:** the real Vertex model has never been called (no credentials). The Kubernetes actions have never run against a cluster. These are the first things to verify when the GCP project is available.
 
+### C19. Gate 2 review and fixes
+An independent read-only review (Opus) of the agents, critic, actions and API found one blocker and six majors. The blocker and the majors were fixed.
+
+| Finding | Severity | Fix |
+|---|---|---|
+| Alertmanager sent no credentials, so `/alerts` returned 401 in the cluster and no alert could open an incident | Blocker | `/alerts` has its own webhook token. Alertmanager presents it from a Secret. |
+| `decided_by` came from the request body, so any token holder could approve as anyone | Major | Approvals need an approver token from `COPILOT_APPROVERS`. The approver's name is recorded, and the body field is gone. |
+| Evidence was written by the model and not checked against tool results, so a diagnosis could cite invented evidence and still pass the critic | Major | Evidence is accepted only if it matches a successful tool result: a queried metric with a returned value, a returned log row ID, or a returned runbook anchor. Log queries now return `id`. |
+| The runbook prompt's output format was not parsed, so doc evidence was dropped and every anchored diagnosis escalated | Major | The prompt now specifies one JSON shape, and the parser reads exactly that shape. |
+| Timeouts: retries could exceed the 60 s overall budget, so the breaker never opened and a half-open trial could stick | Major | Total retry budget (45 s), breaker state reset in `finally`, cancellation counted as a failure. |
+| Restart deleted every engine pod at once: a full outage | Major | One pod at a time, waiting for each replacement to be Ready. A stalled replacement stops the restart and reports partial progress. |
+| No dedupe: Alertmanager re-sends created duplicate incidents and duplicate actions | Major | Dedupe by alert fingerprint while an incident is open; concurrency capped at 4. |
+| No endpoint for the human verdict (DP-4) | PRD gap | `POST /incidents/{id}/verdict`, where the verdict-by name must be an approver. |
+| Trace not stored or returned | PRD gap | `trace` column; returned by `GET /incidents/{id}`. |
+| `copilot_app` could DELETE from `actions` (audit log) | Minor | Revoked. Pg test checks it. |
+| Exception text stored and returned to callers | Minor | Fixed messages; class name only. |
+
+**Still open from the review:**
+- Tokens and cost are stored as 0. Recording them is part of 3.2.
+- `/incidents/{id}/ask` (P1) is not built.
+- Two new secrets must exist in the cluster before `/alerts` works: `copilot-webhook` (Alertmanager's token) and the copilot's `COPILOT_WEBHOOK_TOKEN` and `COPILOT_APPROVERS` in `copilot-env`. Neither is in git.
+- The Alertmanager token mount is nested inside the read-only config mount. That is valid, but it can only be checked on a real cluster.
+- The API was not tested through a real `asyncio.wait_for` timeout path.
+
+**Test status after the fixes:** `ruff` clean; 137 passed, 0 skipped, with the compose Postgres up.
+
 ### C7. Tickets still running at time of writing
 - 1.5 logs loader (Postgres loader with idempotent delete-then-insert per file)
 - 1.6 docs chunking and embedding (Embedder protocol, fake embedder for tests)

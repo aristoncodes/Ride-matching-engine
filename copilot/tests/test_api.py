@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import uuid
 
@@ -8,6 +9,8 @@ import pytest
 pytestmark = pytest.mark.asyncio
 
 os.environ.setdefault("COPILOT_API_TOKEN", "test-token")
+os.environ.setdefault("COPILOT_WEBHOOK_TOKEN", "test-webhook")
+os.environ.setdefault("COPILOT_APPROVERS", "root=test-approver")
 
 from copilot.agents.coordinator import InvestigationResult  # noqa: E402
 from copilot.agents.model import ModelUnavailable  # noqa: E402
@@ -16,6 +19,8 @@ from copilot.models import Diagnosis, Evidence, ProposedAction  # noqa: E402
 
 TOKEN = "tok-123"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
+WEBHOOK = {"Authorization": "Bearer hook-tok"}
+ALICE = {"Authorization": "Bearer alice-tok"}
 
 
 class Conn:
@@ -56,6 +61,8 @@ class FakePool:
         self.calls.append((sql, args))
 
     async def fetchrow(self, sql, *args):
+        if sql.lstrip().startswith("UPDATE"):
+            self.calls.append((sql, args))
         return self.incident_row if "incidents_seen" in sql else {"result": None}
 
     async def fetch(self, sql, *args):
@@ -76,6 +83,9 @@ class FakePool:
 
     def inserts(self, table):
         return [c for c in self.calls if c[0].lstrip().startswith(f"INSERT INTO {table}")]
+
+    def calls_for(self, text):
+        return [c for c in self.calls if text in c[0]]
 
     def updates(self):
         return [c for c in self.calls if c[0].lstrip().startswith("UPDATE incidents_seen")]
@@ -133,6 +143,8 @@ def env(monkeypatch):
         guarded_model=object(),
         k8s_api=FakeApi(),
         api_token=TOKEN,
+        webhook_token="hook-tok",
+        approvers={"alice": "alice-tok", "bob": "bob-tok"},
         clock=lambda: clock["t"],
     )
     app = app_mod.create_app(deps)
@@ -206,6 +218,10 @@ async def test_model_unavailable_exception_still_200(env):
     assert r.status_code == 200 and r.json()["status"] == "failed"
 
 
+def firing(name, fp):
+    return {"status": "firing", "fingerprint": fp, "labels": {"alertname": name}}
+
+
 async def test_alerts_firing_only(env):
     app, c, pool, *_ = env
     body = {
@@ -215,7 +231,7 @@ async def test_alerts_firing_only(env):
             {"status": "firing", "labels": {"alertname": "C"}},
         ]
     }
-    r = await c.post("/alerts", json=body, headers=AUTH)
+    r = await c.post("/alerts", json=body, headers=WEBHOOK)
     assert r.status_code == 202
     assert len(r.json()["incident_ids"]) == 2
     await asyncio.gather(*list(app.state.tasks))
@@ -233,18 +249,159 @@ async def test_rate_limit(env):
     assert (await c.get("/incidents/" + str(uuid.uuid4()), headers=AUTH)).status_code == 404
 
 
-async def test_approve_empty_decided_by_422(env):
-    _, c, *_ = env
-    r = await c.post(f"/actions/{uuid.uuid4()}/approve", json={"decided_by": ""}, headers=AUTH)
-    assert r.status_code == 422
-
-
 async def test_approve_not_proposed_409(env):
     _, c, pool, *_ = env
     pool.action_row = {"status": "executed"}
-    r = await c.post(f"/actions/{uuid.uuid4()}/approve", json={"decided_by": "me"}, headers=AUTH)
+    r = await c.post(f"/actions/{uuid.uuid4()}/approve", headers=ALICE)
     assert r.status_code == 409
+    assert "executed" not in r.text
     assert not env[2].inserts("actions")
+
+
+async def test_webhook_token_alerts_only(env):
+    app, c, *_ = env
+    body = {"alerts": [firing("A", "f1")]}
+    assert (await c.post("/alerts", json=body, headers=WEBHOOK)).status_code == 202
+    await asyncio.gather(*list(app.state.tasks))
+    assert (await c.post("/alerts", json=body, headers=AUTH)).status_code == 401
+    r = await c.post(f"/actions/{uuid.uuid4()}/approve", headers=WEBHOOK)
+    assert r.status_code == 403
+    assert (await c.post("/diagnose", json=BODY, headers=WEBHOOK)).status_code == 401
+
+
+async def test_api_token_cannot_approve(env):
+    _, c, *_ = env
+    r = await c.post(f"/actions/{uuid.uuid4()}/approve", headers=AUTH)
+    assert r.status_code == 403
+    r = await c.post(f"/actions/{uuid.uuid4()}/approve")
+    assert r.status_code == 401
+
+
+async def test_approver_decided_by_is_token_name(env):
+    _, c, pool, *_ = env
+    aid = str(uuid.uuid4())
+    seen = {}
+
+    async def fake_decide(p, action_id, approve, decided_by, api):
+        seen["by"] = decided_by
+        return "executed"
+
+    orig = app_mod.k8s.decide
+    app_mod.k8s.decide = fake_decide
+    try:
+        r = await c.post(f"/actions/{aid}/approve", json={"decided_by": "mallory"}, headers=ALICE)
+    finally:
+        app_mod.k8s.decide = orig
+    assert r.status_code == 200 and r.json()["status"] == "executed"
+    assert seen["by"] == "alice"
+
+
+async def test_failed_action_result_is_fixed_message(env):
+    _, c, pool, *_ = env
+
+    async def fake_decide(*a):
+        return "failed"
+
+    async def fetchrow(sql, *args):
+        return {"result": "ApiException: secret detail"}
+
+    pool.fetchrow = fetchrow
+    orig = app_mod.k8s.decide
+    app_mod.k8s.decide = fake_decide
+    try:
+        r = await c.post(f"/actions/{uuid.uuid4()}/approve", headers=ALICE)
+    finally:
+        app_mod.k8s.decide = orig
+    assert r.json()["result"] == "action execution failed; see logs"
+
+
+async def test_bad_token_is_rate_limited(env):
+    _, c, *_ = env
+    bad = {"Authorization": "Bearer guess"}
+    for _ in range(30):
+        assert (await c.get("/incidents/" + str(uuid.uuid4()), headers=bad)).status_code == 401
+    r = await c.get("/incidents/" + str(uuid.uuid4()), headers=bad)
+    assert r.status_code == 429
+
+
+async def test_duplicate_firing_alert_deduped(env):
+    app, c, pool, *_ = env
+    body = {"alerts": [firing("A", "same")]}
+    first = (await c.post("/alerts", json=body, headers=WEBHOOK)).json()["incident_ids"]
+    await asyncio.gather(*list(app.state.tasks))
+    second = (await c.post("/alerts", json=body, headers=WEBHOOK)).json()["incident_ids"]
+    assert second == first
+    assert len(pool.inserts("incidents_seen")) == 1
+    assert not app.state.tasks
+
+
+async def test_failed_incident_allows_retry(env):
+    app, c, pool, state, _ = env
+    state["result"] = InvestigationResult(None)
+    body = {"alerts": [firing("A", "again")]}
+    first = (await c.post("/alerts", json=body, headers=WEBHOOK)).json()["incident_ids"]
+    await asyncio.gather(*list(app.state.tasks))
+    second = (await c.post("/alerts", json=body, headers=WEBHOOK)).json()["incident_ids"]
+    await asyncio.gather(*list(app.state.tasks))
+    assert second != first
+
+
+async def test_propose_db_error_marks_failed(env):
+    _, c, pool, *_ = env
+
+    async def boom(*a, **k):
+        raise RuntimeError("db down")
+
+    orig = app_mod.k8s.propose
+    app_mod.k8s.propose = boom
+    try:
+        j = (await c.post("/diagnose", json=BODY, headers=AUTH)).json()
+    finally:
+        app_mod.k8s.propose = orig
+    assert j["status"] == "failed" and j["fallback"] is not None and j["action_id"] is None
+    assert pool.updates()[0][1][1] == "failed"
+
+
+async def test_verdict(env):
+    _, c, pool, *_ = env
+    iid = uuid.uuid4()
+    pool.incident_row = {"id": iid}
+    url = f"/incidents/{iid}/verdict"
+    r = await c.post(url, json={"verdict": "partly", "verdict_by": "alice"}, headers=ALICE)
+    assert r.status_code == 200
+    sql, args = pool.calls_for("verdict=")[0]
+    assert args[1:] == ("partly", "alice")
+    bad = await c.post(url, json={"verdict": "meh", "verdict_by": "alice"}, headers=ALICE)
+    assert bad.status_code == 422
+    other = await c.post(url, json={"verdict": "wrong", "verdict_by": "bob"}, headers=ALICE)
+    assert other.status_code == 403
+    nonappr = await c.post(url, json={"verdict": "wrong", "verdict_by": "alice"}, headers=AUTH)
+    assert nonappr.status_code == 403
+
+
+async def test_verdict_missing_incident_404(env):
+    _, c, *_ = env
+    r = await c.post(
+        f"/incidents/{uuid.uuid4()}/verdict",
+        json={"verdict": "correct", "verdict_by": "alice"},
+        headers=ALICE,
+    )
+    assert r.status_code == 404
+
+
+async def test_trace_stored_and_returned(env):
+    _, c, pool, state, _ = env
+    trace = [{"step": 1, "agent": "logs", "tool": "t", "ms": 3}]
+    state["result"] = InvestigationResult(diagnosis(), trace=trace)
+    await c.post("/diagnose", json=BODY, headers=AUTH)
+    assert json.loads(pool.updates()[0][1][7]) == trace
+    iid = uuid.uuid4()
+    pool.incident_row = {
+        "id": iid, "status": "diagnosed", "trigger": "{}", "diagnosis": None,
+        "fallback": None, "trace": json.dumps(trace),
+    }  # fmt: skip
+    j = (await c.get(f"/incidents/{iid}", headers=AUTH)).json()
+    assert j["trace"] == trace
 
 
 async def test_incident_404(env):

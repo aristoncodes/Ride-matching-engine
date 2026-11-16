@@ -303,6 +303,10 @@ data:
         webhook_configs:
           - url: http://copilot.ride-matching:8000/alerts
             send_resolved: true
+            http_config:
+              authorization:
+                type: Bearer
+                credentials_file: /etc/alertmanager/webhook-token/token
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -344,10 +348,16 @@ spec:
             capabilities: { drop: ["ALL"] }
           volumeMounts:
             - { name: config, mountPath: /etc/alertmanager, readOnly: true }
+            - { name: webhook-token, mountPath: /etc/alertmanager/webhook-token, readOnly: true }
             - { name: data, mountPath: /alertmanager }
       volumes:
         - name: config
           configMap: { name: alertmanager-config }
+        # Secret copilot-webhook (key: token) is created outside git, e.g.
+        #   kubectl -n ride-matching create secret generic copilot-webhook --from-literal=token=...
+        # Its value must equal COPILOT_WEBHOOK_TOKEN on the copilot Deployment.
+        - name: webhook-token
+          secret: { secretName: copilot-webhook }
         - name: data
           emptyDir: {}
 ---

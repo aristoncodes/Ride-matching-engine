@@ -10,4 +10,9 @@ Rules:
 4. Give the matching chunk an evidence ID in the form E<n>, kind "doc", ref set to "source_file#anchor", and an excerpt of at most three sentences copied from the chunk.
 5. Return the top five results, ranked, so the coordinator can see alternatives.
 
-Return a JSON object with a ranked list of candidates (anchor, score, evidence id) and the single best anchor or null.
+Return exactly one JSON object, and nothing else, in this shape:
+
+{"evidence": [{"id": "E1", "kind": "doc", "ref": "docs/Runbook.md#queue-backlog", "excerpt": "..."}],
+ "best_anchor": "docs/Runbook.md#queue-backlog" or null}
+
+"evidence" holds the cited chunks (at most five, ranked). "best_anchor" is the single best ref from that list, or null. Do not use any other keys.

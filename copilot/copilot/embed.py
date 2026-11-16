@@ -51,8 +51,9 @@ class VertexEmbedder:
 
     dim: int = VERTEX_DIM
 
-    def __init__(self, model_name: str = VERTEX_MODEL) -> None:
+    def __init__(self, model_name: str = VERTEX_MODEL, timeout_s: float = 10.0) -> None:
         self._model_name = model_name
+        self._timeout_s = timeout_s
         self._model: Any = None
         self._cache: dict[str, list[float]] = {}
 
@@ -76,7 +77,15 @@ class VertexEmbedder:
             model = self._get_model()
             for start in range(0, len(items), VERTEX_BATCH):
                 batch = items[start : start + VERTEX_BATCH]
-                results = await asyncio.to_thread(model.get_embeddings, [t for _, t in batch])
+                try:
+                    results = await asyncio.wait_for(
+                        asyncio.to_thread(model.get_embeddings, [t for _, t in batch]),
+                        timeout=self._timeout_s,
+                    )
+                except TimeoutError as exc:
+                    raise RuntimeError(
+                        f"Vertex embedding call timed out after {self._timeout_s:g}s"
+                    ) from exc
                 for (key, _), result in zip(batch, results, strict=True):
                     self._cache[key] = [float(v) for v in result.values]
 

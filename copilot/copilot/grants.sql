@@ -30,7 +30,9 @@ BEGIN
       GRANT SELECT, INSERT, UPDATE, DELETE ON incidents_seen TO copilot_app;
     END IF;
     IF to_regclass('actions') IS NOT NULL THEN
-      GRANT SELECT, INSERT, UPDATE, DELETE ON actions TO copilot_app;
+      -- No DELETE: the app must not be able to erase its own audit trail (AC-3).
+      REVOKE ALL ON actions FROM copilot_app;
+      GRANT SELECT, INSERT, UPDATE ON actions TO copilot_app;
     END IF;
   END IF;
 END

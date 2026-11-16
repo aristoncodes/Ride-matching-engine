@@ -152,3 +152,42 @@ def test_no_prompt_in_logs(caplog):
     text = caplog.text
     for s in (SECRET_SYS, SECRET_USER, "OUT-SECRET"):
         assert s not in text
+
+
+def test_cancel_clears_trial_flag_and_counts_failure():
+    clock = Clock()
+    inner = FakeInner(fail_times=1)
+    m = make(inner, retries=0, breaker_threshold=1, breaker_cooldown_s=60, clock=clock)
+
+    async def go():
+        with pytest.raises(ModelUnavailable):
+            await m.generate("s", "a")  # opens the breaker
+        clock.t += 61
+        inner.delay = 10
+        task = asyncio.ensure_future(m.generate("s", "b"))  # half-open trial
+        await asyncio.sleep(0.05)
+        assert m._trial_in_flight is True
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert m._trial_in_flight is False
+        assert m._opened_at == clock.t  # cancellation re-opened the breaker
+        clock.t += 61
+        inner.delay = 0
+        assert await m.generate("s", "c") == "ANSWER-TEXT"  # a new trial is admitted
+
+    run(go())
+
+
+def test_total_budget_stops_retries_early():
+    clock = Clock()
+    inner = FakeInner(fail_times=99)
+
+    async def sleep(d):
+        clock.t += d
+
+    m = make(inner, retries=5, timeout_s=20, total_budget_s=1.2, clock=clock, sleep=sleep)
+    with pytest.raises(ModelUnavailable):
+        run(m.generate("s", "u"))
+    # backoffs 0.5 then 1.0: the third attempt would land at 1.5 > 1.2
+    assert inner.calls == 2

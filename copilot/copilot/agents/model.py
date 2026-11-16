@@ -75,6 +75,7 @@ class GuardedModel:
         *,
         cache: Cache,
         timeout_s: float = 20.0,
+        total_budget_s: float = 45.0,
         retries: int = 2,
         breaker_threshold: int = 5,
         breaker_cooldown_s: float = 60.0,
@@ -84,6 +85,7 @@ class GuardedModel:
         self._inner = inner
         self._cache = cache
         self._timeout_s = timeout_s
+        self._total_budget_s = total_budget_s
         self._retries = retries
         self._threshold = breaker_threshold
         self._cooldown_s = breaker_cooldown_s
@@ -136,25 +138,47 @@ class GuardedModel:
         trial = self._admit()
         attempts = self._retries + 1
         last: BaseException | None = None
-        for attempt in range(attempts):
-            try:
-                out = await asyncio.wait_for(
-                    self._inner.generate(system, user), timeout=self._timeout_s
-                )
-            except Exception as exc:  # includes TimeoutError
-                last = exc
-                log.warning(
-                    "model call failed: attempt %d/%d error=%s",
-                    attempt + 1,
-                    attempts,
-                    type(exc).__name__,
-                )
-                if attempt < attempts - 1:
-                    await self._sleep(0.5 * (2**attempt))
-                continue
-            self._record_success()
-            await self._cache_set(key, out)
-            return out
+        start = self._clock()
+        settled = False
+        try:
+            for attempt in range(attempts):
+                remaining = self._total_budget_s - (self._clock() - start)
+                if remaining <= 0:
+                    break
+                try:
+                    out = await asyncio.wait_for(
+                        self._inner.generate(system, user),
+                        timeout=min(self._timeout_s, remaining),
+                    )
+                except Exception as exc:  # includes TimeoutError
+                    last = exc
+                    log.warning(
+                        "model call failed: attempt %d/%d error=%s",
+                        attempt + 1,
+                        attempts,
+                        type(exc).__name__,
+                    )
+                    if attempt < attempts - 1:
+                        delay = 0.5 * (2**attempt)
+                        if self._clock() - start + delay >= self._total_budget_s:
+                            break  # the next attempt would not fit in the budget
+                        await self._sleep(delay)
+                    continue
+                settled = True
+                self._record_success()
+                await self._cache_set(key, out)
+                return out
 
-        self._record_failure(trial)
-        raise ModelUnavailable(f"model failed after {attempts} attempts: {type(last).__name__}")
+            settled = True
+            self._record_failure(trial)
+            name = type(last).__name__ if last else "BudgetExhausted"
+            raise ModelUnavailable(f"model failed after {attempts} attempts: {name}")
+        except asyncio.CancelledError:
+            # Cancelled inside a call (e.g. the outer deadline): that counts as a failure.
+            if not settled:
+                settled = True
+                self._record_failure(trial)
+            raise
+        finally:
+            if not settled:
+                self._trial_in_flight = False

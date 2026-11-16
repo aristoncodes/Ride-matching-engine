@@ -43,6 +43,7 @@ class Rows:
             ]
         return [
             {
+                "id": 42,
                 "ts": "t",
                 "service": "batcherd",
                 "level": "ERROR",
@@ -71,8 +72,13 @@ class Prom:
         return Resp()
 
 
-def ev(kind, ref):
-    return json.dumps([{"id": "E1", "kind": kind, "ref": ref, "excerpt": "x"}])
+def ev(kind, ref, excerpt="x"):
+    return json.dumps([{"id": "E1", "kind": kind, "ref": ref, "excerpt": excerpt}])
+
+
+def rb(ref, best=None):
+    item = {"id": "E1", "kind": "doc", "ref": ref, "excerpt": "x"}
+    return json.dumps({"evidence": [item], "best_anchor": best or ref})
 
 
 def call(name, args):
@@ -83,15 +89,15 @@ def scripts(diag):
     return {
         "metrics": [
             call("query_metric", {"name": "queue_depth", "window_minutes": 15}),
-            ev("metric", "queue_depth@15m"),
+            ev("metric", "queue_depth@15m", "queue_depth=5 at ts 1.0"),
         ],
         "logs": [
             call("query_logs", {"name": "errors_by_service", "params": {"minutes": 10}}),
-            ev("log", "row1"),
+            ev("log", "42"),
         ],
         "runbook": [
             call("search_runbook", {"query": "queue rising"}),
-            ev("doc", "docs/Runbook.md#queue-backlog"),
+            rb("docs/Runbook.md#queue-backlog"),
         ],
         "coordinator": diag,
     }
@@ -188,3 +194,94 @@ def test_tool_error_does_not_raise():
 @pytest.mark.parametrize("text", ['```json\n{"a":1}\n```', '{"a":1}'])
 def test_strip_fences(text):
     assert json.loads(co._strip_fences(text)) == {"a": 1}
+
+
+def _evidence_kinds(r):
+    return [e.kind for e in r.evidence]
+
+
+def test_ungrounded_evidence_dropped():
+    s = scripts([diag()])
+    s["metrics"][1] = ev("metric", "queue_depth@15m", "queue_depth=999")  # value not returned
+    s["logs"][1] = ev("log", "row-invented")
+    s["runbook"][1] = rb("docs/Runbook.md#invented")
+    r = asyncio.run(run(FakeModel(s)))
+    assert r.evidence == []
+
+
+def test_unqueried_metric_and_no_tool_call_give_no_evidence():
+    s = scripts([diag()])
+    s["metrics"] = [ev("metric", "queue_depth@15m", "5")]  # never called the tool
+    s["logs"][0] = call("query_logs", {"name": "bogus", "params": {}})  # tool errors
+    r = asyncio.run(run(FakeModel(s)))
+    assert _evidence_kinds(r) == ["doc"]
+
+
+def test_runbook_prompt_shape_gives_doc_evidence_old_shape_none():
+    r = asyncio.run(run(FakeModel(scripts([diag()]))))
+    assert _evidence_kinds(r) == ["metric", "log", "doc"]
+    s = scripts([diag()])
+    s["runbook"][1] = ev("doc", "docs/Runbook.md#queue-backlog")  # old list shape
+    r = asyncio.run(run(FakeModel(s)))
+    assert "doc" not in _evidence_kinds(r)
+
+
+def test_null_anchor_chunk_not_allowed():
+    class NullAnchorRows(Rows):
+        async def fetch(self, sql, *args):
+            if "doc_chunks" in sql:
+                return [
+                    {
+                        "source_file": "docs/A.md",
+                        "anchor": None,
+                        "heading": "h",
+                        "content": "c",
+                        "score": 0.5,
+                    }
+                ]
+            return await super().fetch(sql, *args)
+
+    s = scripts([diag(anchor="docs/A.md#None")])
+    s["runbook"][1] = rb("docs/A.md#None")
+
+    async def go():
+        return await co.investigate(
+            {"alert": "x"},
+            model=FakeModel(s),
+            pool_ro=NullAnchorRows(),
+            prom_client=Prom(),
+            prom_base_url="http://p",
+            embedder=Emb(),
+            critic=False,
+        )
+
+    r = asyncio.run(go())
+    assert "doc" not in _evidence_kinds(r)
+    assert r.diagnosis.runbook_anchor is None
+
+
+def test_needs_human_forces_no_action_even_with_high_confidence():
+    d = json.loads(diag(conf=0.95))
+    d["needs_human"] = True
+    r = asyncio.run(run(FakeModel(scripts([json.dumps(d)]))))
+    assert r.diagnosis.needs_human is True
+    assert r.diagnosis.proposed_action.kind == "none"
+
+
+def test_partial_evidence_on_timeout():
+    class SlowLogsModel(FakeModel):
+        async def generate(self, system, user):
+            if system == co._prompt("logs"):
+                await asyncio.sleep(5)
+            return await super().generate(system, user)
+
+    async def go():
+        task = asyncio.ensure_future(run(SlowLogsModel(scripts([diag()]))))
+        await asyncio.sleep(0.3)
+        task.cancel()
+        return await task
+
+    r = asyncio.run(go())
+    assert r.diagnosis is None
+    assert _evidence_kinds(r) == ["metric", "doc"]
+    assert [e.id for e in r.evidence] == ["E1", "E2"]

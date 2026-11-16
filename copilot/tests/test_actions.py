@@ -10,7 +10,14 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
-from copilot.actions.k8s import ActionError, decide, propose, validate
+from copilot.actions.k8s import (
+    ActionError,
+    KubernetesActions,
+    RestartStalled,
+    decide,
+    propose,
+    validate,
+)
 from copilot.db import apply_schema, connect
 from copilot.models import ProposedAction
 
@@ -23,7 +30,7 @@ class FakeApi:
     def restart_pods(self, namespace: str, deployment: str) -> str:
         self.calls.append(("restart", namespace, deployment))
         if self.fail:
-            raise RuntimeError("boom")
+            raise RuntimeError("boom-secret-body")
         return "restarted"
 
     def scale(self, namespace: str, deployment: str, replicas: int) -> str:
@@ -83,6 +90,79 @@ async def test_empty_decided_by_refused(who):
     with pytest.raises(ActionError):
         await decide(None, str(uuid.uuid4()), True, who, api)  # type: ignore[arg-type]
     assert api.calls == []
+
+
+# ---- restart_pods, one pod at a time (fake cluster) ----
+
+
+class _Obj:
+    def __init__(self, **kw) -> None:
+        self.__dict__.update(kw)
+
+
+class FakeCore:
+    """Fake pods. A deleted pod is replaced by a pod that turns Ready after `lag` lists."""
+
+    def __init__(self, n=3, lag=1, stall=False) -> None:
+        self.pods = {f"p{i}": True for i in range(n)}
+        self.lag, self.stall = lag, stall
+        self.pending: list[list] = []  # [name, lists_left]
+        self.log: list[tuple] = []
+        self.n = n
+
+    def list_namespaced_pod(self, ns, label_selector=None):
+        assert label_selector == "app.kubernetes.io/name=matching-engine"
+        for p in self.pending:
+            if p[1] > 0:
+                p[1] -= 1
+            elif not self.stall:
+                self.pods[p[0]] = True
+        items = [
+            _Obj(
+                metadata=_Obj(name=n, deletion_timestamp=None),
+                status=_Obj(conditions=[_Obj(type="Ready", status="True" if r else "False")]),
+            )
+            for n, r in self.pods.items()
+        ]
+        self.log.append(("list", sum(self.pods.values())))
+        return _Obj(items=items)
+
+    def delete_namespaced_pod(self, name, ns):
+        self.log.append(("delete", sum(self.pods.values())))
+        del self.pods[name]
+        self.n += 1
+        new = f"p{self.n}"
+        self.pods[new] = False
+        self.pending.append([new, self.lag])
+
+
+def _k8s(core, sleeps):
+    return KubernetesActions(core=core, apps=object(), sleep=sleeps.append)
+
+
+def test_restart_deletes_one_pod_at_a_time():
+    core, sleeps = FakeCore(n=3), []
+    msg = _k8s(core, sleeps).restart_pods("ride-matching", "matching-engine")
+    assert "3" in msg
+    deletes = [e for e in core.log if e[0] == "delete"]
+    assert len(deletes) == 3
+    # every delete happens only when all 3 pods were Ready again (never an outage)
+    assert all(ready == 3 for _, ready in deletes)
+    assert sleeps and set(sleeps) == {3}
+
+
+def test_restart_stalled_stops_and_reports_progress():
+    core, sleeps = FakeCore(n=3, stall=True), []
+    with pytest.raises(RestartStalled) as ei:
+        _k8s(core, sleeps).restart_pods("ride-matching", "matching-engine")
+    assert ei.value.restarted == 0
+    assert len([e for e in core.log if e[0] == "delete"]) == 1
+    assert sum(sleeps) == 120
+
+
+def test_restart_namespace_checked():
+    with pytest.raises(ActionError):
+        _k8s(FakeCore(), []).restart_pods("kube-system", "matching-engine")
 
 
 # ---- Postgres paths ----
@@ -153,7 +233,9 @@ async def test_failure_recorded(pool):
     aid = await propose(pool, await _incident(pool), _act("restart_pods", replicas=None), "hung")
     assert await decide(pool, aid, True, "alice", api) == "failed"
     row = await pool.fetchrow("SELECT * FROM actions WHERE id=$1", uuid.UUID(aid))
-    assert row["status"] == "failed" and "boom" in row["result"] and row["decided_by"] == "alice"
+    assert row["status"] == "failed" and row["decided_by"] == "alice"
+    assert row["result"] == "failed: RuntimeError"
+    assert "boom" not in row["result"]
 
 
 @pg
@@ -188,3 +270,37 @@ async def test_bad_row_not_approved(pool):
     assert api.calls == []
     status = await pool.fetchval("SELECT status FROM actions WHERE id=$1", aid)
     assert status == "proposed"
+
+
+@pg
+@pytest.mark.asyncio
+async def test_failed_restart_counts_toward_rate_limit(pool):
+    iid = await _incident(pool)
+    a1 = await propose(pool, iid, _act("restart_pods", replicas=None), "r1")
+    a2 = await propose(pool, iid, _act("restart_pods", replicas=None), "r2")
+    assert await decide(pool, a1, True, "alice", FakeApi(fail=True)) == "failed"
+    api = FakeApi()
+    with pytest.raises(ActionError):
+        await decide(pool, a2, True, "alice", api)
+    assert api.calls == []
+
+
+@pg
+@pytest.mark.asyncio
+async def test_copilot_app_cannot_delete_actions():
+    dsn = os.environ["COPILOT_TEST_DSN"]
+    p = await connect(dsn)
+    try:
+        await apply_schema(p)
+        has_role = await p.fetchval("SELECT 1 FROM pg_roles WHERE rolname='copilot_app'")
+        if not has_role:
+            pytest.skip("copilot_app role not present")
+        can_delete = await p.fetchval(
+            "SELECT has_table_privilege('copilot_app', 'actions', 'DELETE')"
+        )
+        can_insert = await p.fetchval(
+            "SELECT has_table_privilege('copilot_app', 'actions', 'INSERT')"
+        )
+        assert can_insert and not can_delete
+    finally:
+        await p.close()
