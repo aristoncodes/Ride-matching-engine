@@ -18,12 +18,16 @@
 #   redis_stall       CLIENT PAUSE on redis-0                  redis-stall
 #   --none            no fault                                 (NULL)
 #
-# Every run writes one row to incidents_truth before the fault is injected.
+# Every run writes one row to incidents_truth after preflight passes and before
+# the fault is injected. If injection then fails, that row is UPDATEd: its
+# target gets ' [injection_failed]' and expected_runbook becomes NULL.
+# The eval MUST exclude rows whose target contains [injection_failed].
 # The copilot has no grant on that table, and this script never prints its
 # rows. Stdout carries only the run index and the fault name.
 #
-# Ground truth needs TRUTH_DSN, a connection string for the injector's own role.
-# It is read from the environment and never hard-coded or printed.
+# Ground truth needs the injector's own Postgres role, taken from the libpq
+# environment: PGHOST, PGUSER, PGDATABASE, and PGPASSWORD (or ~/.pgpass).
+# The password is never a psql argument, so it never shows up in ps.
 #
 # Usage: ./k8s/fault-inject.sh --fault <name> --runs <N>
 #        ./k8s/fault-inject.sh --none --runs <N>
@@ -39,7 +43,7 @@ BURST_RATE=${BURST_RATE:-300}
 BURST_SECONDS=${BURST_SECONDS:-60}
 BURST_DRIVERS=${BURST_DRIVERS:-200}
 SLOW_CPU_LIMIT=${SLOW_CPU_LIMIT:-500m}   # must stay >= the 250m request
-REDIS_PAUSE_MS=60000
+REDIS_PAUSE_MS=$(( (FAULT_HOLD_SECONDS + 5) * 1000 ))   # hold plus margin: the pause starts before the hold sleep
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -98,7 +102,10 @@ case "$FAULT" in
 esac
 
 # Ground truth is mandatory. Failing here means nothing was injected.
-[[ -n "${TRUTH_DSN:-}" ]] || die "TRUTH_DSN is not set; the injector cannot record ground truth"
+# psql reads these from the environment, so no password is ever a command-line argument.
+for v in PGHOST PGUSER PGDATABASE; do
+  [[ -n "${!v:-}" ]] || die "$v is not set; the injector cannot record ground truth"
+done
 
 # ---------------------------------------------------------------------------
 # Restore state. Every change records its ORIGINAL value first, and the EXIT
@@ -111,6 +118,7 @@ PENDING_INGESTD=0
 PENDING_ENGINE_CPU=0
 PENDING_REDIS_PAUSE=0
 WORK=""
+INJECT_RUN_ID=""   # set from record_truth until inject returns; see cleanup
 
 restore_all() {
   local rc=0
@@ -157,6 +165,15 @@ restore_all() {
 cleanup() {
   local rc=$?
   trap - EXIT
+  # A run that exits while its fault is being injected never happened in full,
+  # so its truth row is marked and the eval excludes it.
+  if [[ -n "$INJECT_RUN_ID" ]]; then
+    if mark_injection_failed "$INJECT_RUN_ID"; then
+      bad "run $INJECT_RUN_ID marked [injection_failed] in incidents_truth"
+    else
+      bad "could not mark run $INJECT_RUN_ID as [injection_failed]; exclude it by hand"; rc=1
+    fi
+  fi
   if ! restore_all; then
     rc=1
   fi
@@ -177,8 +194,17 @@ record_truth() {
   local run_id="$1" start="$2"
   local expected_sql="NULL"
   [[ -n "$EXPECTED" ]] && expected_sql=$(sql_quote "$EXPECTED")
-  psql "$TRUTH_DSN" -v ON_ERROR_STOP=1 -q -c \
+  psql -v ON_ERROR_STOP=1 -q -c \
     "INSERT INTO incidents_truth (run_id, fault, target, start_time, expected_runbook) VALUES ($(sql_quote "$run_id"), $(sql_quote "$FAULT"), $(sql_quote "$TARGET"), $(sql_quote "$start")::timestamptz, $expected_sql);" \
+    >/dev/null
+}
+
+# Called when a run's injection fails after its row was written. The row stays
+# for the audit trail but is tagged so the eval can exclude it.
+mark_injection_failed() {
+  local run_id="$1"
+  psql -v ON_ERROR_STOP=1 -q -c \
+    "UPDATE incidents_truth SET expected_runbook = NULL, target = target || ' [injection_failed]' WHERE run_id = $(sql_quote "$run_id");" \
     >/dev/null
 }
 
@@ -224,9 +250,7 @@ inject() {
     traffic_burst)
       # The load generator blocks for its own duration (riders / rate), so no
       # separate hold is needed. Its output goes to a file, not stdout.
-      command -v go >/dev/null 2>&1 || die "go is required to build cmd/loadtest for traffic_burst"
-      WORK=$(mktemp -d)
-      (cd "$ROOT/infrastructure" && go build -o "$WORK/loadtest" ./cmd/loadtest)
+      # The binary was built in preflight, so a failed build never reaches here.
       local riders=$(( BURST_RATE * BURST_SECONDS ))
       "$WORK/loadtest" --mode=pipeline --ws "$WS" --rest "$REST" \
         --drivers "$BURST_DRIVERS" --riders "$riders" --rate "$BURST_RATE" \
@@ -236,17 +260,35 @@ inject() {
 }
 
 # ---------------------------------------------------------------------------
+# Preflight. Every check that can fail without changing the cluster runs here,
+# once, before the loop and before any ground-truth row is written.
+for cmd in kubectl psql; do
+  command -v "$cmd" >/dev/null 2>&1 || die "$cmd is required"
+done
 kubectl -n "$NS" get deployment >/dev/null 2>&1 \
   || die "cannot reach the ride-matching namespace; is the stack deployed? (./k8s/deploy.sh)"
+if [[ "$FAULT" == "traffic_burst" ]]; then
+  command -v go >/dev/null 2>&1 || die "go is required to build cmd/loadtest for traffic_burst"
+  WORK=$(mktemp -d)
+  (cd "$ROOT/infrastructure" && go build -o "$WORK/loadtest" ./cmd/loadtest) \
+    || die "go build of cmd/loadtest failed; no fault injected"
+fi
+if [[ "$FAULT" == "redis_stall" ]]; then
+  kubectl -n "$NS" exec redis-0 -- redis-cli PING >/dev/null 2>&1 \
+    || die "cannot reach redis-0; no fault injected"
+fi
 
-log "fault=$FAULT target=$TARGET runs=$RUNS"
+log "fault=$FAULT runs=$RUNS"
 for i in $(seq 1 "$RUNS"); do
   RUN_INDEX=$(printf '%03d' "$i")
   RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$RUN_INDEX"
-  START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
+  # start_time is taken right before the injection, after preflight.
+  START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   record_truth "$RUN_ID" "$START" || die "could not write incidents_truth; no fault injected"
+  INJECT_RUN_ID="$RUN_ID"
   inject
+  INJECT_RUN_ID=""
   restore_all || die "restore failed on run $RUN_INDEX; the EXIT trap will retry"
 
   printf 'run %s/%s fault=%s ok\n' "$i" "$RUNS" "$FAULT"

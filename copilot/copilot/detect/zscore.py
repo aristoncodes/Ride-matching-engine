@@ -11,7 +11,7 @@ import math
 import os
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from statistics import fmean, pstdev
 
 import httpx
@@ -36,7 +36,8 @@ AD1_QUERIES: dict[str, str] = {
 
 DEFAULT_PROMETHEUS_URL = "http://localhost:9090"
 DEFAULT_STEP_SECONDS = 15
-STD_FLOOR = 1e-9
+STD_FLOOR_REL = 0.05  # std is at least 5% of |mean| so flat series do not explode
+STD_FLOOR_ABS = 1.0  # absolute floor for count-like metrics (dead-lettered, drivers)
 
 
 @dataclass(frozen=True)
@@ -57,9 +58,11 @@ def detect(
     """Flag sustained deviations in each series.
 
     A point is scored against the previous `window` points (mean and population
-    std, std floored at 1e-9). It is deviant when |z| > z_threshold. An event fires
-    once per run of deviant points, at the point where the run reaches `sustain`.
-    Points before the window is full are not scored.
+    std, with std_eff = max(std, 0.05 * |mean|, 1.0)). It is deviant when
+    |z| > z_threshold. An event fires once per run of deviant points, at the point
+    where the run reaches `sustain`. Deviant points are not added to the baseline,
+    so a sustained anomaly cannot pull the window toward itself. Points before the
+    window is full are not scored.
     """
     if window < 2:
         raise ValueError("window must be >= 2")
@@ -86,7 +89,7 @@ def _detect_one(
     for ts, value in sorted(points, key=lambda p: p[0]):
         if len(history) == window:
             mean = fmean(history)
-            std = max(pstdev(history), STD_FLOOR)
+            std = max(pstdev(history), STD_FLOOR_REL * abs(mean), STD_FLOOR_ABS)
             z = (value - mean) / std
             if abs(z) > z_threshold:
                 if run_len == 0:
@@ -98,8 +101,9 @@ def _detect_one(
                     events.append(
                         DetectionEvent(metric, run_first_ts, ts, run_peak, value)
                     )
-            else:
-                run_len = 0
+                # Deviant points stay out of the baseline while the run lasts.
+                continue
+            run_len = 0
         history.append(value)
     return events
 
@@ -138,8 +142,17 @@ async def fetch_series(
     return sorted(totals.items())
 
 
-async def run_once(base_url: str, minutes: int = 15) -> list[DetectionEvent]:
-    """Query every AD-1 metric over the last `minutes` and run detect."""
+async def run_once(
+    base_url: str,
+    minutes: int = 15,
+    seen: set[tuple[str, float]] | None = None,
+) -> list[DetectionEvent]:
+    """Query every AD-1 metric over the last `minutes` and run detect.
+
+    Each poll rescans the whole window, so the same run is detected again. If
+    `seen` is given, events whose (metric, first_ts) key is already in it are
+    skipped, and new keys are added to it. Callers keep one set across polls.
+    """
     end = time.time()
     start = end - minutes * 60
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -149,16 +162,23 @@ async def run_once(base_url: str, minutes: int = 15) -> list[DetectionEvent]:
                 for promql in AD1_QUERIES.values()
             )
         )
-    return detect(dict(zip(AD1_QUERIES, results, strict=True)))
+    events = detect(dict(zip(AD1_QUERIES, results, strict=True)))
+    if seen is None:
+        return events
+    fresh = [e for e in events if (e.metric, e.first_ts) not in seen]
+    seen.update((e.metric, e.first_ts) for e in fresh)
+    return fresh
 
 
 def to_diagnose_payload(event: DetectionEvent) -> dict[str, object]:
-    """Request body for POST /diagnose (AD-3) with source="detector"."""
+    """Request body for POST /diagnose (AD-3) with source="detector".
+
+    NOTE: the API ticket must add a `detection` field to DiagnoseRequest. Until it
+    does, this payload will not validate against the planned schema.
+    """
     return {
         "source": "detector",
-        "metric": event.metric,
-        "first_ts": event.first_ts,
-        "last_ts": event.last_ts,
-        "peak_z": event.peak_z,
-        "value_at_detection": event.value_at_detection,
+        "alert": None,
+        "question": None,
+        "detection": asdict(event),
     }

@@ -57,6 +57,33 @@ def test_parse_maps_slog_keys_and_puts_unknown_keys_in_fields() -> None:
     assert json.loads(row.fields) == {"attempt": 2, "queue": {"n": 1}}
 
 
+def test_err_key_fills_error_column() -> None:
+    # The services log the error under "err" (slog.Error("msg", "err", err)).
+    row = parse_line(_line(service="ingestd", err="dial tcp: refused", attempt=1))
+    assert row is not None
+    assert row.error == "dial tcp: refused"
+    assert json.loads(row.fields) == {"attempt": 1}  # "err" is mapped, not duplicated
+
+
+def test_error_key_still_accepted_and_wins_over_err() -> None:
+    row = parse_line(_line(service="ingestd", error="from-error", err="from-err"))
+    assert row is not None
+    assert row.error == "from-error"
+    alias = parse_line(_line(service="ingestd", error="only-error"))
+    assert alias is not None and alias.error == "only-error"
+
+
+def test_line_hash_is_sha256_of_raw_line() -> None:
+    import hashlib
+
+    line = _line(service="ingestd", request_id="h1")
+    row = parse_line(line)
+    assert row is not None
+    assert row.line_hash == hashlib.sha256(line.encode("utf-8")).hexdigest()
+    other = parse_line(_line(service="ingestd", request_id="h2"))
+    assert other is not None and other.line_hash != row.line_hash
+
+
 def test_service_falls_back_to_parameter_and_line_wins() -> None:
     no_svc = _line()
     assert parse_line(no_svc, default_service="batcherd").service == "batcherd"  # type: ignore[union-attr]
@@ -115,12 +142,41 @@ async def test_load_then_rerun_does_not_duplicate(pool: asyncpg.Pool, tmp_path) 
     try:
         assert await load_logs(pool, path) == 2
         assert await _count(pool, svc) == 2
-        assert await load_logs(pool, path) == 2  # same file again
+        assert await load_logs(pool, path) == 0  # same file again: nothing new
         assert await _count(pool, svc) == 2  # no duplicates
         fields = await pool.fetchval(
             "SELECT fields FROM logs WHERE service = $1 AND request_id = 'b'", svc
         )
         assert json.loads(fields) == {"extra": 1}
+    finally:
+        await pool.execute("DELETE FROM logs WHERE service = $1", svc)
+
+
+@pytest.mark.pg
+@pytest.mark.asyncio
+async def test_loading_one_pod_keeps_other_pods_rows(
+    pool: asyncpg.Pool,
+    tmp_path,  # type: ignore[no-untyped-def]
+) -> None:
+    svc = f"test-{uuid.uuid4().hex[:8]}"
+    pod_a = tmp_path / "pod-a.jsonl"
+    pod_b = tmp_path / "pod-b.jsonl"
+    # Same service, overlapping time window, different lines (different pods).
+    pod_a.write_text(_line(time="2026-11-16T10:00:00Z", service=svc, request_id="a1") + "\n")
+    pod_b.write_text(
+        _line(time="2026-11-16T10:00:00Z", service=svc, request_id="b1", err="boom")
+        + "\n"
+        + _line(time="2026-11-16T10:00:02Z", service=svc, request_id="b2")
+        + "\n"
+    )
+    try:
+        assert await load_logs(pool, pod_b) == 2
+        assert await load_logs(pool, pod_a) == 1
+        assert await _count(pool, svc) == 3  # pod B's rows survive pod A's load
+        err = await pool.fetchval(
+            "SELECT error FROM logs WHERE service = $1 AND request_id = 'b1'", svc
+        )
+        assert err == "boom"
     finally:
         await pool.execute("DELETE FROM logs WHERE service = $1", svc)
 

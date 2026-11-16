@@ -14,7 +14,7 @@ import asyncpg
 import pytest
 
 from copilot.embed import Embedder, FakeEmbedder, VertexEmbedder
-from copilot.ingest.docs import chunk_markdown, index_docs
+from copilot.ingest.docs import chunk_markdown, index_docs, is_indexable, select_docs
 
 FIXTURE = """# Guide
 
@@ -83,6 +83,24 @@ def test_h1_chunk_does_not_span_h2_sections() -> None:
     assert "intro line" in title.content
     assert "Section Two" not in title.content
     assert "section body" not in title.content
+
+
+def test_select_docs_excludes_docs_copilot_dir(tmp_path: Path) -> None:
+    (tmp_path / "docs" / "copilot").mkdir(parents=True)
+    (tmp_path / "docs" / "Runbook.md").write_text("# Runbook\n", encoding="utf-8")
+    (tmp_path / "docs" / "copilot" / "PRD.md").write_text("# PRD\n", encoding="utf-8")
+    selected = select_docs(tmp_path)
+    assert [p.name for p in selected] == ["Runbook.md"]
+
+
+def test_is_indexable_relative_and_absolute_paths(tmp_path: Path) -> None:
+    root = tmp_path
+    assert not is_indexable(root / "docs" / "copilot" / "PRD.md", root)
+    assert not is_indexable(root / "docs" / "copilot" / "sub" / "x.md", root)
+    assert is_indexable(root / "docs" / "Runbook.md", root)
+    assert is_indexable(root / "docs" / "api" / "copilot" / "x.md", root)
+    rel = Path(os.path.relpath(root))
+    assert not is_indexable(root / "docs" / "copilot" / "PRD.md", rel)
 
 
 def test_fake_embedder_is_deterministic_and_normalised() -> None:

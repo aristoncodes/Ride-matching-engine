@@ -4,12 +4,14 @@ import math
 import httpx
 import pytest
 
+import copilot.detect.zscore as zscore
 from copilot.detect import (
     AD1_QUERIES,
     DetectionEvent,
     detect,
     fetch_series,
     prometheus_url,
+    run_once,
     to_diagnose_payload,
 )
 
@@ -48,8 +50,8 @@ def test_sustained_step_change_fires_exactly_once() -> None:
 
 
 def test_constant_series_std_floor_avoids_divide_by_zero() -> None:
-    # Constant history has std 0; the 1e-9 floor keeps z finite.
-    values = [5.0] * 30 + [6.0] * 3
+    # Constant history has std 0; the floor keeps z finite.
+    values = [5.0] * 30 + [50.0] * 3
     events = detect({"m": _series(values)})
     assert len(events) == 1
     assert math.isfinite(events[0].peak_z)
@@ -57,6 +59,32 @@ def test_constant_series_std_floor_avoids_divide_by_zero() -> None:
 
 def test_constant_series_is_silent() -> None:
     assert detect({"a": _series([0.0] * 60), "b": _series([7.0] * 60)}) == []
+
+
+def test_flat_zero_series_single_step_to_one_does_not_fire() -> None:
+    # Absolute floor of 1.0 means a step of 1 is z = 1, below the threshold.
+    values = [0.0] * 60
+    values[40] = 1.0
+    assert detect({"m": _series(values)}) == []
+
+
+def test_flat_zero_series_sustained_step_to_fifty_fires() -> None:
+    values = [0.0] * 30 + [50.0] * 5
+    points = _series(values)
+    events = detect({"m": points})
+    assert len(events) == 1
+    assert events[0].first_ts == points[30][0]
+    assert events[0].value_at_detection == 50.0
+
+
+def test_baseline_frozen_during_deviant_run_still_fires() -> None:
+    # With window=5 and sustain=5, a baseline that absorbed the step would go quiet
+    # before the run reached 5 points. Frozen baseline keeps every step point deviant.
+    points = _series(_noisy(10.0, 5) + [100.0] * 6)
+    events = detect({"m": points}, window=5, sustain=5)
+    assert len(events) == 1
+    assert events[0].first_ts == points[5][0]
+    assert events[0].last_ts == points[9][0]
 
 
 def test_fewer_points_than_window_fires_nothing() -> None:
@@ -74,12 +102,51 @@ def test_to_diagnose_payload_shape() -> None:
     event = DetectionEvent("queue_depth", 1.0, 2.0, 4.5, 99.0)
     assert to_diagnose_payload(event) == {
         "source": "detector",
-        "metric": "queue_depth",
-        "first_ts": 1.0,
-        "last_ts": 2.0,
-        "peak_z": 4.5,
-        "value_at_detection": 99.0,
+        "alert": None,
+        "question": None,
+        "detection": {
+            "metric": "queue_depth",
+            "first_ts": 1.0,
+            "last_ts": 2.0,
+            "peak_z": 4.5,
+            "value_at_detection": 99.0,
+        },
     }
+
+
+@pytest.mark.asyncio
+async def test_run_once_skips_events_already_in_seen(monkeypatch: pytest.MonkeyPatch) -> None:
+    step_points = _series(_noisy(10.0, 30) + _noisy(100.0, 10))
+
+    async def fake_fetch(client, base_url, promql, start, end, step):  # type: ignore[no-untyped-def]
+        if promql == AD1_QUERIES["queue_depth"]:
+            return step_points
+        return _series([0.0] * 40)
+
+    monkeypatch.setattr(zscore, "fetch_series", fake_fetch)
+    seen: set[tuple[str, float]] = set()
+
+    first = await run_once("http://prom:9090", seen=seen)
+    assert [(e.metric, e.first_ts) for e in first] == [("queue_depth", step_points[30][0])]
+    assert seen == {("queue_depth", step_points[30][0])}
+
+    second = await run_once("http://prom:9090", seen=seen)
+    assert second == []
+    assert len(seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_once_without_seen_returns_every_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    step_points = _series(_noisy(10.0, 30) + _noisy(100.0, 10))
+
+    async def fake_fetch(client, base_url, promql, start, end, step):  # type: ignore[no-untyped-def]
+        if promql == AD1_QUERIES["queue_depth"]:
+            return step_points
+        return _series([0.0] * 40)
+
+    monkeypatch.setattr(zscore, "fetch_series", fake_fetch)
+    assert len(await run_once("http://prom:9090")) == 1
+    assert len(await run_once("http://prom:9090")) == 1
 
 
 def test_ad1_queries_cover_all_six_metrics() -> None:

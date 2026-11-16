@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,10 @@ _HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.*?)[ \t]*$")
 _ANCHOR_RE = re.compile(r'<a\s+id="([^"]+)"\s*>\s*</a>')
 _ANCHOR_LINE_RE = re.compile(r'^\s*<a\s+id="([^"]+)"\s*>\s*</a>\s*$')
 _FENCE_RE = re.compile(r"^\s{0,3}(```|~~~)")
+
+# Directories directly under docs/ that must never reach the RAG corpus: docs/copilot holds
+# the PRD (which contains the fault-to-diagnosis answer key) and internal planning notes.
+EXCLUDED_DIR_PARTS = frozenset({"copilot"})
 
 _INSERT_SQL = (
     "INSERT INTO doc_chunks "
@@ -110,6 +115,19 @@ def _vector_literal(vec: list[float]) -> str:
     return "[" + ",".join(repr(float(x)) for x in vec) + "]"
 
 
+def is_indexable(path: Path, root: Path) -> bool:
+    """False for files under docs/<excluded dir>/. Works for relative or absolute paths."""
+    parts = Path(os.path.abspath(path)).relative_to(os.path.abspath(root)).parts
+    if len(parts) < 3 or parts[0] != "docs":
+        return True
+    return parts[1].lower() not in EXCLUDED_DIR_PARTS
+
+
+def select_docs(root: Path, glob: str = "docs/**/*.md") -> list[Path]:
+    """Sorted files matched by glob that pass is_indexable."""
+    return sorted(p for p in root.glob(glob) if p.is_file() and is_indexable(p, root))
+
+
 async def index_docs(
     pool: asyncpg.Pool,
     embedder: Embedder,
@@ -121,7 +139,7 @@ async def index_docs(
     Each file's old chunks are deleted and new ones inserted in one transaction.
     Returns the number of chunks written. Incremental indexing (DP-3) is out of scope.
     """
-    paths = sorted(p for p in root.glob(glob) if p.is_file())
+    paths = select_docs(root, glob)
 
     files: list[tuple[str, str, list[Chunk]]] = []
     for path in paths:
