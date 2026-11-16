@@ -17,7 +17,15 @@ def _schema_sql() -> str:
     return resources.files("copilot").joinpath("schema.sql").read_text(encoding="utf-8")
 
 
+def _grants_sql() -> str:
+    return resources.files("copilot").joinpath("grants.sql").read_text(encoding="utf-8")
+
+
 async def apply_schema(pool: asyncpg.Pool) -> None:
-    """Apply schema.sql. Idempotent (every statement uses IF NOT EXISTS)."""
+    """Apply schema.sql then grants.sql, as the owner. Idempotent.
+
+    Grants for a role are skipped when that role does not exist (single-user local runs).
+    """
     async with pool.acquire() as conn:
         await conn.execute(_schema_sql())
+        await conn.execute(_grants_sql())

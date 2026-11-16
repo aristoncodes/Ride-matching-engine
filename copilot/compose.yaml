@@ -10,6 +10,13 @@ services:
       POSTGRES_USER: copilot
       POSTGRES_DB: copilot
       POSTGRES_PASSWORD: ${COPILOT_DB_PASSWORD:-copilot-local-only}
+      # Role passwords for initdb/01-roles.sql. The ":-local-only" defaults are for local
+      # development only; set real values in your shell or .env anywhere else.
+      COPILOT_APP_PASSWORD: ${COPILOT_APP_PASSWORD:-local-dev-only}
+      COPILOT_RO_PASSWORD: ${COPILOT_RO_PASSWORD:-local-dev-only}
+      FAULT_INJECTOR_PASSWORD: ${FAULT_INJECTOR_PASSWORD:-local-dev-only}
+    volumes:
+      - ./initdb:/docker-entrypoint-initdb.d:ro
     ports:
       - "5432:5432"
 
