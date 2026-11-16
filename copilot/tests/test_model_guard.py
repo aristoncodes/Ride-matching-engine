@@ -7,7 +7,15 @@ import logging
 
 import pytest
 
-from copilot.agents.model import GuardedModel, InMemoryCache, ModelUnavailable
+from copilot.agents.model import (
+    ChatResult,
+    GuardedModel,
+    InMemoryCache,
+    ModelUnavailable,
+    ModelUsage,
+    ToolCall,
+    record_usage,
+)
 
 SECRET_SYS = "SYSTEM-SECRET-PROMPT"
 SECRET_USER = "USER-SECRET-LOGLINE"
@@ -27,6 +35,15 @@ class FakeInner:
         if self.calls <= self.fail_times:
             raise RuntimeError("boom " + user)
         return self.answer
+
+    async def chat(self, messages, tools=None):
+        self.calls += 1
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.calls <= self.fail_times:
+            raise RuntimeError("boom")
+        record_usage(ModelUsage(10, 2, "m"))
+        return ChatResult("", [ToolCall("c1", "t", {})])
 
 
 class Clock:
@@ -227,3 +244,43 @@ def test_redis_client_has_socket_timeouts(monkeypatch):
     RedisCache("redis://x")._conn()
     assert seen["socket_timeout"] == 1.0
     assert seen["socket_connect_timeout"] == 1.0
+
+
+def test_chat_not_cached_and_usage_accumulates():
+    inner = FakeInner()
+    m = make(inner)
+
+    async def go():
+        m.reset_usage()
+        await m.chat([{"role": "user", "content": "u"}], [])
+        await m.chat([{"role": "user", "content": "u"}], [])
+        return m.usage_total()
+
+    u = run(go())
+    assert inner.calls == 2
+    assert (u.tokens_in, u.tokens_out, u.model) == (20, 4, "m")
+
+
+def test_chat_retries_then_breaker_opens():
+    inner = FakeInner(fail_times=100)
+    clock = Clock()
+    m = make(inner, retries=1, breaker_threshold=2, clock=clock)
+
+    async def go():
+        for _ in range(2):
+            with pytest.raises(ModelUnavailable):
+                await m.chat([], None)
+        before = inner.calls
+        with pytest.raises(ModelUnavailable, match="breaker"):
+            await m.chat([], None)
+        return before
+
+    assert run(go()) == inner.calls == 4
+
+
+def test_chat_budget_applies():
+    inner = FakeInner(delay=0.5)
+    m = make(inner, timeout_s=0.05, total_budget_s=0.1, retries=5)
+    with pytest.raises(ModelUnavailable):
+        run(m.chat([], None))
+    assert inner.calls <= 3

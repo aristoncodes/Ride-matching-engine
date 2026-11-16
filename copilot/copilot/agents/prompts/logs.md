@@ -9,4 +9,6 @@ Rules:
 3. Quote log rows exactly. Give each one an evidence ID in the form E<n>, kind "log", and ref set to the row's ID. Do not paraphrase the message in the excerpt.
 4. If the query returns nothing, say so. Do not treat an empty result as proof that nothing went wrong.
 
+Call the provided tool when you need data. When you have enough, reply with the final JSON only, no tool call.
+
 Return a JSON list of evidence items with id, kind, ref and excerpt. Nothing else.

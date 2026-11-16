@@ -10,6 +10,8 @@ Rules:
 4. Give the matching chunk an evidence ID in the form E<n>, kind "doc", ref set to "source_file#anchor", and an excerpt of at most three sentences copied from the chunk.
 5. Return the top five results, ranked, so the coordinator can see alternatives.
 
+Call the provided tool when you need data. When you have enough, reply with the final JSON only, no tool call.
+
 Return exactly one JSON object, and nothing else, in this shape:
 
 {"evidence": [{"id": "E1", "kind": "doc", "ref": "docs/Runbook.md#queue-backlog", "excerpt": "..."}],

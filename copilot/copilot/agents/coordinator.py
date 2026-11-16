@@ -5,8 +5,10 @@ ADK note: google-adk installs and imports, but it is not used. ModelClient is a 
 LlmAgent/Runner needs a native LLM with function calling. A plain-Python loop keeps the same
 structure (coordinator + three specialists, one function tool each) and is testable offline.
 
-Tool-call protocol (text, since ModelClient returns a string): a specialist replies with
-{"tool_call": {"name": "<tool>", "args": {...}}} to call its tool, or with its final JSON.
+Tool calling is native: each specialist sends a `tools` list through model.chat() and reads
+structured tool_calls back. The text protocol ({"tool_call": ...} JSON in the reply) remains only
+as a fallback when the first reply has neither tool_calls nor parseable JSON, or the model has no
+chat().
 
 Evidence IDs: each specialist numbers its own evidence E1.. so they collide. After the
 specialists return, ALL evidence is renumbered E1..En in role order (metrics, logs, runbook)
@@ -27,14 +29,14 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 from pydantic import ValidationError
 
 from copilot.agents.critic import review
 from copilot.agents.model import GuardedModel, ModelUnavailable
-from copilot.agents.tools.logs_tools import query_logs
-from copilot.agents.tools.metrics_tools import query_metric
+from copilot.agents.tools.logs_tools import LogQuery, query_logs
+from copilot.agents.tools.metrics_tools import MetricQuery, query_metric
 from copilot.agents.tools.runbook_tools import search_runbook
 from copilot.models import CONFIDENCE_FLOOR, Diagnosis, Evidence, ProposedAction
 from copilot.obs import metrics
@@ -56,6 +58,71 @@ TOOL_ARGS = {
     "metrics": 'query_metric args: {"name": <metric name>, "window_minutes": int}',
     "logs": 'query_logs args: {"name": <query name>, "params": {...}}',
     "runbook": 'search_runbook args: {"query": str, "k": int}',
+}
+
+
+def _fn(name: str, description: str, properties: dict, required: list[str]) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+TOOL_SCHEMAS: dict[str, list[dict]] = {
+    "metrics": [
+        _fn(
+            "query_metric",
+            "Query a fixed Prometheus metric over the last window_minutes.",
+            {
+                "name": {"type": "string", "enum": list(get_args(MetricQuery))},
+                "window_minutes": {"type": "integer", "minimum": 1, "maximum": 120},
+            },
+            ["name"],
+        )
+    ],
+    "logs": [
+        _fn(
+            "query_logs",
+            "Run a named log query. errors_by_service needs params {minutes}; trace_request "
+            "needs {request_id}; recent_events_by_service needs {service, minutes}.",
+            {
+                "name": {"type": "string", "enum": list(get_args(LogQuery))},
+                "params": {
+                    "type": "object",
+                    "properties": {
+                        "minutes": {"type": "integer", "minimum": 1, "maximum": 120},
+                        "request_id": {"type": "string"},
+                        "service": {
+                            "type": "string",
+                            "enum": ["ingestd", "requestd", "batcherd"],
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            ["name", "params"],
+        )
+    ],
+    "runbook": [
+        _fn(
+            "search_runbook",
+            "Search the runbook and ADRs; returns chunks with source_file and anchor.",
+            {
+                "query": {"type": "string"},
+                "k": {"type": "integer", "minimum": 1, "maximum": 10},
+            },
+            ["query"],
+        )
+    ],
 }
 
 
@@ -81,10 +148,38 @@ def _strip_fences(text: str) -> str:
 
 
 def _parse_json(text: str) -> Any:
+    """Tolerant JSON extraction: drops <think> blocks, unwraps <tool_call> tags,
+    falls back to the first decodable object, and normalises tool requests."""
+    t = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    m = re.search(r"<tool_call>(.*?)</tool_call>", t, re.DOTALL)
+    if m:
+        t = m.group(1)
+    t = _strip_fences(t)
     try:
-        return json.loads(_strip_fences(text))
+        obj = json.loads(t)
     except ValueError:
-        return None
+        i = t.find("{")
+        if i < 0:
+            return None
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(t[i:])
+        except ValueError:
+            return None
+    return _normalise_tool_request(obj)
+
+
+def _normalise_tool_request(obj: Any) -> Any:
+    if not isinstance(obj, dict):
+        return obj
+    if "tool_call" not in obj and isinstance(obj.get("tool"), str):
+        args = obj.get("args")
+        return {"tool_call": {"name": obj["tool"], "args": args if args is not None else {}}}
+    tc = obj.get("tool_call")
+    if isinstance(tc, dict) and "args" not in tc and "arguments" in tc:
+        tc = {k: v for k, v in tc.items() if k != "arguments"}
+        tc["args"] = obj["tool_call"]["arguments"]
+        return {**obj, "tool_call": tc}
+    return obj
 
 
 def _dump(obj: Any) -> str:
@@ -151,7 +246,78 @@ class _Specialist:
             span.set_attribute("status", "unavailable" if self.unavailable else "ok")
             return out
 
+    async def _call_tool(self, name: str, args: dict) -> Any:
+        """Run one tool; errors become an error result for the model, never raise."""
+        t0 = time.monotonic()
+        try:
+            result: Any = await self._run_tool(name, args)
+            self._step(name, t0, "ok")
+            self.raw_results.append(result)
+            return result
+        except Exception as exc:
+            self._step(name, t0, "error")
+            return {"error": type(exc).__name__, "detail": str(exc)[:200]}
+
     async def _run(self, task: str, model: GuardedModel) -> list[Evidence]:
+        system = _prompt(self.role)
+        chat = getattr(model, "chat", None)
+        if chat is None:
+            return await self._run_text(task, model)
+        messages: list[dict] = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": task},
+        ]
+        tools = TOOL_SCHEMAS[self.role]
+        calls = 0
+        final: Any = None
+        for turn in range(MAX_TOOL_CALLS + 2):
+            t0 = time.monotonic()
+            offer = tools if calls < MAX_TOOL_CALLS else None
+            try:
+                res = await chat(messages, offer)
+            except ModelUnavailable:
+                self._step("model", t0, "unavailable")
+                self.unavailable = True
+                return []
+            self._step("model", t0, "ok")
+            if not res.tool_calls:
+                parsed = _parse_json(res.text)
+                text_call = isinstance(parsed, dict) and isinstance(parsed.get("tool_call"), dict)
+                if turn == 0 and (parsed is None or text_call):
+                    return await self._run_text(task, model)
+                final = parsed
+                break
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": res.text or None,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
+                        }
+                        for tc in res.tool_calls
+                    ],
+                }
+            )
+            for tc in res.tool_calls:
+                if calls >= MAX_TOOL_CALLS:
+                    result: Any = {
+                        "error": "ToolBudgetExhausted",
+                        "detail": "reply with final JSON",
+                    }
+                elif tc.error:
+                    calls += 1
+                    result = {"error": "BadArguments", "detail": tc.error}
+                else:
+                    calls += 1
+                    result = await self._call_tool(tc.name, tc.arguments)
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": _dump(result)})
+        return self._evidence(final)
+
+    async def _run_text(self, task: str, model: GuardedModel) -> list[Evidence]:
+        """Fallback: text tool protocol over generate()."""
         system = _prompt(self.role)
         user = f"{task}\n\n{TOOL_PROTOCOL}\n{TOOL_ARGS[self.role]}"
         calls = 0
@@ -176,14 +342,7 @@ class _Specialist:
             calls += 1
             name = str(call.get("name"))
             args = call.get("args") if isinstance(call.get("args"), dict) else {}
-            t0 = time.monotonic()
-            try:
-                result: Any = await self._run_tool(name, args)
-                self._step(name, t0, "ok")
-                self.raw_results.append(result)
-            except Exception as exc:  # tool errors go back to the model, never raise
-                self._step(name, t0, "error")
-                result = {"error": type(exc).__name__, "detail": str(exc)[:200]}
+            result = await self._call_tool(name, args)
             user += f"\n\nTool result for {name}:\n{_dump(result)}"
         return self._evidence(final)
 

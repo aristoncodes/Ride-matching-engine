@@ -10,4 +10,6 @@ Rules:
 4. If a query returns no data, say so. Do not infer a value from the absence of data. An absent series can mean the exporter is down, not that the value is zero.
 5. For the latency symptoms, compare batch_size_mean with solve_seconds_per_rider over the same window and say which one moved.
 
+Call the provided tool when you need data. When you have enough, reply with the final JSON only, no tool call.
+
 Return a JSON list of evidence items with id, kind, ref and excerpt (the value, the timestamp and the window). Nothing else.

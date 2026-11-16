@@ -5,7 +5,7 @@ import logging
 import pytest
 
 from copilot.agents import coordinator as co
-from copilot.agents.model import ModelUnavailable
+from copilot.agents.model import ChatResult, ModelUnavailable, ToolCall
 from copilot.models import CONFIDENCE_FLOOR
 
 SECRET = "SECRET-LOG-PAYLOAD-xyz"
@@ -27,6 +27,21 @@ class FakeModel:
                     raise ModelUnavailable("down")
                 return self.scripts[role].pop(0)
         raise AssertionError("unknown system prompt")
+
+    async def chat(self, messages, tools=None):
+        """Native-tools turn: a scripted {"tool_call": ...} JSON entry becomes a tool_calls."""
+        self.requests = getattr(self, "requests", [])
+        self.requests.append((json.loads(json.dumps(messages)), tools))
+        out = await self.generate(messages[0]["content"], messages[1]["content"])
+        try:
+            obj = json.loads(out)
+        except ValueError:
+            return ChatResult(out, [])
+        tc = obj.get("tool_call") if isinstance(obj, dict) else None
+        if isinstance(tc, dict):
+            n = len(self.requests)
+            return ChatResult("", [ToolCall(f"call_{n}", tc["name"], tc["args"])])
+        return ChatResult(out, [])
 
 
 class Rows:
@@ -270,10 +285,10 @@ def test_needs_human_forces_no_action_even_with_high_confidence():
 
 def test_partial_evidence_on_timeout():
     class SlowLogsModel(FakeModel):
-        async def generate(self, system, user):
-            if system == co._prompt("logs"):
+        async def chat(self, messages, tools=None):
+            if messages[0]["content"] == co._prompt("logs"):
                 await asyncio.sleep(5)
-            return await super().generate(system, user)
+            return await super().chat(messages, tools)
 
     async def go():
         task = asyncio.ensure_future(run(SlowLogsModel(scripts([diag()]))))
@@ -301,3 +316,88 @@ def test_non_finite_metric_values_do_not_ground_evidence():
     role.metric_values = {"solve_p99@15m": [float("nan"), float("inf")]}
     item = {"kind": "metric", "ref": "solve_p99@15m", "excerpt": "p99=nan then inf"}
     assert role._grounded(item) == "excerpt lacks a returned value"
+
+
+def test_parse_qwen_tool_call_tag_with_prose():
+    text = (
+        "Let me check the queue.\n<tool_call>\n"
+        '{"tool": "query_metric", "args": {"metric": "queue_depth", "window_minutes": 15}}\n'
+        "</tool_call>\nThanks."
+    )
+    assert co._parse_json(text) == {
+        "tool_call": {
+            "name": "query_metric",
+            "args": {"metric": "queue_depth", "window_minutes": 15},
+        }
+    }
+
+
+def test_parse_think_block_then_final_evidence():
+    text = '<think>hmm {"x": 1}</think>\n{"evidence": [{"kind": "metric", "ref": "r"}]}'
+    assert co._parse_json(text) == {"evidence": [{"kind": "metric", "ref": "r"}]}
+
+
+def test_parse_old_shape_unchanged():
+    obj = {"tool_call": {"name": "query_logs", "args": {"a": 1}}}
+    assert co._parse_json(json.dumps(obj)) == obj
+
+
+def test_parse_arguments_normalised_to_args():
+    text = 'ok {"tool_call": {"name": "t", "arguments": {"q": 1}}}'
+    assert co._parse_json(text) == {"tool_call": {"name": "t", "args": {"q": 1}}}
+
+
+def test_parse_non_json_returns_none():
+    assert co._parse_json("no json here") is None
+    assert co._parse_json("broken { not json") is None
+
+
+def test_qwen_style_tool_call_end_to_end():
+    s = scripts(json.dumps(json.loads(diag())))
+    qwen = (
+        "<think>plan</think>I'll query.\n<tool_call>\n"
+        '{"tool": "query_metric", "args": {"name": "queue_depth", "window_minutes": 15}}\n'
+        "</tool_call>"
+    )
+    s["metrics"][0] = qwen
+    s["metrics"].insert(0, qwen)  # first turn is chat (no tool_calls, text tag) -> text fallback
+    r = asyncio.run(run(FakeModel(s)))
+    assert "metric" in _evidence_kinds(r)
+
+
+def test_native_loop_sends_tool_message_back_with_matching_id():
+    m = FakeModel(scripts([diag()]))
+    r = asyncio.run(run(m))
+    assert _evidence_kinds(r) == ["metric", "log", "doc"]
+    reqs = [q for q in m.requests if q[0][0]["content"] == co._prompt("metrics")]
+    assert len(reqs) == 2
+    assert reqs[0][1] == co.TOOL_SCHEMAS["metrics"]
+    msgs = reqs[1][0]
+    asst = next(x for x in msgs if x["role"] == "assistant")
+    tool = next(x for x in msgs if x["role"] == "tool")
+    assert tool["tool_call_id"] == asst["tool_calls"][0]["id"]
+    assert json.loads(tool["content"])[0]["value"] == 5.0
+
+
+def test_tool_schemas_have_enums_and_coordinator_gets_no_tools():
+    fn = co.TOOL_SCHEMAS["metrics"][0]["function"]
+    assert "queue_depth" in fn["parameters"]["properties"]["name"]["enum"]
+    m = FakeModel(scripts([diag()]))
+    asyncio.run(run(m))
+    coord = [q for q in m.requests if q[0][0]["content"] == co._prompt("coordinator")]
+    assert coord == []  # coordinator uses generate(), not chat with tools
+
+
+def test_bad_arguments_go_back_as_error_not_raise():
+    class BadArgs(FakeModel):
+        async def chat(self, messages, tools=None):
+            if messages[0]["content"] == co._prompt("metrics") and len(messages) == 2:
+                return ChatResult(
+                    "", [ToolCall("c1", "query_metric", {}, "arguments were not valid JSON")]
+                )
+            return await super().chat(messages, tools)
+
+    s = scripts([diag()])
+    s["metrics"] = [ev("metric", "queue_depth@15m", "queue_depth=5")]
+    r = asyncio.run(run(BadArgs(s)))
+    assert "metric" not in _evidence_kinds(r)

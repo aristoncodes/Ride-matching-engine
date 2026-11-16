@@ -13,9 +13,11 @@ import time
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 log = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 CACHE_TTL_S = 3600
 REDIS_TIMEOUT_S = 1.0
@@ -52,8 +54,24 @@ def record_usage(usage: ModelUsage) -> None:
         sink.append(usage)
 
 
+@dataclass(frozen=True)
+class ToolCall:
+    id: str
+    name: str
+    arguments: dict
+    error: str | None = None  # set when the arguments string was not valid JSON
+
+
+@dataclass
+class ChatResult:
+    text: str
+    tool_calls: list[ToolCall]
+
+
 class ModelClient(Protocol):
     async def generate(self, system: str, user: str) -> str: ...
+
+    async def chat(self, messages: list[dict], tools: list[dict] | None = None) -> ChatResult: ...
 
 
 class ModelUnavailable(Exception):
@@ -194,7 +212,16 @@ class GuardedModel:
         cached = await self._cache_get(key)
         if cached is not None:
             return cached
+        out = await self._guarded(lambda: self._inner.generate(system, user))
+        await self._cache_set(key, out)
+        return out
 
+    async def chat(self, messages: list[dict], tools: list[dict] | None = None) -> ChatResult:
+        """Chat turn with optional native tools. Never cached: tool turns depend on history."""
+        return await self._guarded(lambda: self._inner.chat(messages, tools))
+
+    async def _guarded(self, call: Callable[[], Awaitable[T]]) -> T:
+        """One path for timeout, retry with backoff, breaker and usage accumulation."""
         trial = self._admit()
         attempts = self._retries + 1
         last: BaseException | None = None
@@ -208,10 +235,7 @@ class GuardedModel:
                 sink: list[ModelUsage] = []
                 _sink_var.set(sink)
                 try:
-                    out = await asyncio.wait_for(
-                        self._inner.generate(system, user),
-                        timeout=min(self._timeout_s, remaining),
-                    )
+                    out = await asyncio.wait_for(call(), timeout=min(self._timeout_s, remaining))
                 except Exception as exc:  # includes TimeoutError
                     last = exc
                     log.warning(
@@ -229,7 +253,6 @@ class GuardedModel:
                 settled = True
                 self._add_usage(sink)
                 self._record_success()
-                await self._cache_set(key, out)
                 return out
 
             settled = True
