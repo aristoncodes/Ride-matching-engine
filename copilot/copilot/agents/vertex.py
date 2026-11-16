@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from copilot.agents.model import ModelUsage, record_usage
+
 DEFAULT_MODEL = "gemini-2.5-flash"
 
 
@@ -12,6 +14,7 @@ class VertexClient:
     def __init__(self, model: str | None = None) -> None:
         self._model = model
         self._client: Any = None
+        self.last_usage: ModelUsage | None = None  # usage of the most recent call
 
     def _conn(self) -> Any:
         if self._client is None:
@@ -33,4 +36,14 @@ class VertexClient:
             contents=user,
             config=types.GenerateContentConfig(system_instruction=system, temperature=0.0),
         )
+        # google-genai exposes usage_metadata.prompt_token_count / candidates_token_count.
+        # Missing metadata is recorded as 0.
+        meta = getattr(resp, "usage_metadata", None)
+        usage = ModelUsage(
+            int(getattr(meta, "prompt_token_count", 0) or 0),
+            int(getattr(meta, "candidates_token_count", 0) or 0),
+            model,
+        )
+        self.last_usage = usage
+        record_usage(usage)
         return resp.text or ""

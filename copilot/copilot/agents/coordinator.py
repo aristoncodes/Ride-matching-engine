@@ -13,7 +13,7 @@ specialists return, ALL evidence is renumbered E1..En in role order (metrics, lo
 and the coordinator only ever sees the renumbered IDs, so its claims are already correct.
 Claims citing an ID that does not exist are stripped of it (the critic then rejects them).
 
-Tokens: GuardedModel.generate returns only text, so tokens_in/out are 0 until it exposes usage.
+Tokens: GuardedModel.usage_total() accumulates real usage per investigation.
 Trace entries hold step, agent, tool, ms, status only; never prompt or model text.
 """
 
@@ -36,6 +36,8 @@ from copilot.agents.tools.logs_tools import query_logs
 from copilot.agents.tools.metrics_tools import query_metric
 from copilot.agents.tools.runbook_tools import search_runbook
 from copilot.models import CONFIDENCE_FLOOR, Diagnosis, Evidence, ProposedAction
+from copilot.obs import metrics
+from copilot.obs.tracing import emit_step, get_tracer
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +45,7 @@ PROMPTS = Path(__file__).parent / "prompts"
 MAX_TOOL_CALLS = 4
 MAX_RESULT_CHARS = 6000
 ROLES = ("metrics", "logs", "runbook")
+_ROLE_TOOL = {"metrics": "query_metric", "logs": "query_logs", "runbook": "search_runbook"}
 
 TOOL_PROTOCOL = (
     'To call your tool reply with only {"tool_call": {"name": "<tool>", "args": {...}}}. '
@@ -63,6 +66,7 @@ class InvestigationResult:
     tokens_in: int = 0
     tokens_out: int = 0
     critic_enabled: bool = True
+    model: str = ""
 
 
 def _prompt(name: str) -> str:
@@ -99,15 +103,19 @@ class _Specialist:
         self.unavailable = False
 
     def _step(self, tool: str, t0: float, status: str) -> None:
+        ms = int((time.monotonic() - t0) * 1000)
         self.trace.append(
             {
                 "step": len(self.trace) + 1,
                 "agent": self.role,
                 "tool": tool,
-                "ms": int((time.monotonic() - t0) * 1000),
+                "ms": ms,
                 "status": status,
             }
         )
+        emit_step(self.role, tool, status, ms)
+        if status == "error":
+            metrics.tool_error(tool)
 
     async def _run_tool(self, name: str, args: dict) -> Any:
         c = self.ctx
@@ -133,6 +141,16 @@ class _Specialist:
         raise ValueError(f"unknown tool {name!r} for {self.role}")
 
     async def run(self, task: str, model: GuardedModel) -> list[Evidence]:
+        t0 = time.monotonic()
+        with get_tracer().start_as_current_span(f"{self.role}.run") as span:
+            span.set_attribute("agent", self.role)
+            span.set_attribute("tool", _ROLE_TOOL[self.role])
+            out = await self._run(task, model)
+            span.set_attribute("duration_ms", int((time.monotonic() - t0) * 1000))
+            span.set_attribute("status", "unavailable" if self.unavailable else "ok")
+            return out
+
+    async def _run(self, task: str, model: GuardedModel) -> list[Evidence]:
         system = _prompt(self.role)
         user = f"{task}\n\n{TOOL_PROTOCOL}\n{TOOL_ARGS[self.role]}"
         calls = 0
@@ -272,6 +290,9 @@ async def investigate(
         "prom_base_url": prom_base_url,
         "embedder": embedder,
     }
+    reset = getattr(model, "reset_usage", None)
+    if reset is not None:
+        reset()
     trace: list[dict] = []
     task = "Investigate this alert or question:\n" + json.dumps(alert_or_question, default=str)
     specialists = {r: _Specialist(r, ctx, trace) for r in ROLES}
@@ -287,10 +308,15 @@ async def investigate(
         )
 
     try:
-        return await _work()
+        result = await _work()
     except asyncio.CancelledError:
         # Overall deadline hit: hand back what the specialists had finished.
-        return InvestigationResult(None, _merge(per_role), trace, critic_enabled=critic)
+        result = InvestigationResult(None, _merge(per_role), trace, critic_enabled=critic)
+    usage_total = getattr(model, "usage_total", None)
+    if usage_total is not None:
+        u = usage_total()
+        result.tokens_in, result.tokens_out, result.model = u.tokens_in, u.tokens_out, u.model
+    return result
 
 
 async def _coordinate(
@@ -348,15 +374,11 @@ async def _coordinate(
 
 
 def _critic_step(trace: list[dict], t0: float, status: str) -> None:
+    ms = int((time.monotonic() - t0) * 1000)
     trace.append(
-        {
-            "step": len(trace) + 1,
-            "agent": "critic",
-            "tool": None,
-            "ms": int((time.monotonic() - t0) * 1000),
-            "status": status,
-        }
+        {"step": len(trace) + 1, "agent": "critic", "tool": None, "ms": ms, "status": status}
     )
+    emit_step("critic", None, status, ms)
 
 
 async def _review(d: Diagnosis, evidence: list[Evidence], model: GuardedModel, trace: list[dict]):
@@ -424,10 +446,12 @@ async def _criticize(
 
 
 def _coord_step(trace: list[dict], t0: float, status: str) -> dict:
+    ms = int((time.monotonic() - t0) * 1000)
+    emit_step("coordinator", "model", status, ms)
     return {
         "step": len(trace) + 1,
         "agent": "coordinator",
         "tool": "model",
-        "ms": int((time.monotonic() - t0) * 1000),
+        "ms": ms,
         "status": status,
     }

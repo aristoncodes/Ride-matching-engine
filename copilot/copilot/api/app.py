@@ -30,14 +30,18 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field, model_validator
 
 from copilot.actions import k8s
 from copilot.actions.k8s import ActionError
 from copilot.agents.coordinator import investigate
 from copilot.agents.tools.runbook_tools import search_runbook
+from copilot.agents.vertex import DEFAULT_MODEL
+from copilot.cost import cost_usd
 from copilot.models import Diagnosis
+from copilot.obs import metrics
 
 log = logging.getLogger("copilot.api")
 
@@ -186,6 +190,7 @@ async def _run(deps: AppDeps, incident_id: str, req: DiagnoseRequest) -> Diagnos
     trace: list[dict] = []
     evidence: list = []
     tokens_in = tokens_out = 0
+    model_id = ""
     try:
         result = await asyncio.wait_for(
             investigate(
@@ -201,6 +206,7 @@ async def _run(deps: AppDeps, incident_id: str, req: DiagnoseRequest) -> Diagnos
         diagnosis = result.diagnosis
         trace, evidence = result.trace, result.evidence
         tokens_in, tokens_out = result.tokens_in, result.tokens_out
+        model_id = result.model
         if diagnosis is None:
             fallback = await _fallback(deps, result.evidence, trigger, "model unavailable")
     except Exception as exc:  # noqa: BLE001 - never 500 because of the model or a slow tool
@@ -223,17 +229,26 @@ async def _run(deps: AppDeps, incident_id: str, req: DiagnoseRequest) -> Diagnos
                 status = "failed"
                 fallback = await _fallback(deps, evidence, trigger, "action proposal failed")
 
+    elapsed = time.monotonic() - t0
+    model_id = model_id or os.environ.get("VERTEX_MODEL", DEFAULT_MODEL)
+    cost = cost_usd(model_id, tokens_in, tokens_out)
+    metrics.MODEL_TOKENS.labels("in").inc(tokens_in)
+    metrics.MODEL_TOKENS.labels("out").inc(tokens_out)
+    metrics.MODEL_COST.inc(cost)
+    metrics.DIAGNOSIS_SECONDS.observe(elapsed)
+    metrics.DIAGNOSES.labels(status).inc()
     await deps.pool_app.execute(
         "UPDATE incidents_seen SET status=$2, diagnosis=$3::jsonb, fallback=$4::jsonb, "
-        "tokens_in=$5, tokens_out=$6, latency_ms=$7, trace=$8::jsonb WHERE id=$1",
+        "tokens_in=$5, tokens_out=$6, latency_ms=$7, trace=$8::jsonb, cost_usd=$9 WHERE id=$1",
         uuid.UUID(incident_id),
         status,
         _js(diagnosis.model_dump()) if diagnosis else None,
         _js(fallback) if fallback is not None else None,
         tokens_in,
         tokens_out,
-        int((time.monotonic() - t0) * 1000),
+        int(elapsed * 1000),
         _js(trace),
+        round(cost, 6),
     )
     return DiagnoseResponse(
         incident_id=incident_id,
@@ -341,6 +356,12 @@ def create_app(
     @app.get("/healthz")
     async def healthz() -> dict:
         return {"status": "ok"}
+
+    # Deliberately NOT behind the bearer token: Prometheus scrapes without credentials. It
+    # exposes only aggregate counters and histograms, no request data, prompts or incident text.
+    @app.get("/metrics")
+    async def metrics_endpoint() -> Response:
+        return Response(generate_latest(metrics.REGISTRY), media_type=CONTENT_TYPE_LATEST)
 
     @app.post("/diagnose", response_model=DiagnoseResponse, dependencies=guard)
     async def diagnose(req: DiagnoseRequest) -> DiagnoseResponse:

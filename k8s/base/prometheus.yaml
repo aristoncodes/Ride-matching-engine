@@ -124,6 +124,12 @@ data:
             target_label: __address__
             replacement: $1:6062
 
+      # The copilot's own metrics (ticket 3.2). /metrics needs no credentials.
+      - job_name: copilot
+        metrics_path: /metrics
+        static_configs:
+          - targets: ["copilot.ride-matching:8000"]
+
   alert-rules.yml: |
     # Alert rules from docs/Observability.md ("Alerting rules"), plus one Redis
     # rule. runbook_anchor points at the matching section of docs/Runbook.md.

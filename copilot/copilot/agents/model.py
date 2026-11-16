@@ -11,12 +11,44 @@ import logging
 import os
 import time
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 log = logging.getLogger(__name__)
 
 CACHE_TTL_S = 3600
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
+
+
+@dataclass(frozen=True)
+class ModelUsage:
+    tokens_in: int
+    tokens_out: int
+    model: str
+
+
+class _Acc:
+    """Mutable per-investigation usage total, shared by the tasks of one investigation."""
+
+    def __init__(self) -> None:
+        self.tokens_in = 0
+        self.tokens_out = 0
+        self.model = ""
+
+
+# Per-investigation accumulator; asyncio.gather children copy the context and share the object.
+_acc_var: ContextVar[_Acc | None] = ContextVar("copilot_usage_acc", default=None)
+# Per-call sink: GuardedModel sets a fresh list before each inner call; the client appends to
+# it. wait_for runs the call in a child task, which shares the list through the copied context.
+_sink_var: ContextVar[list[ModelUsage] | None] = ContextVar("copilot_usage_sink", default=None)
+
+
+def record_usage(usage: ModelUsage) -> None:
+    """Called by a ModelClient after a call to report its token usage."""
+    sink = _sink_var.get()
+    if sink is not None:
+        sink.append(usage)
 
 
 class ModelClient(Protocol):
@@ -95,6 +127,16 @@ class GuardedModel:
         self._opened_at: float | None = None
         self._trial_in_flight = False
 
+    def reset_usage(self) -> None:
+        """Start a fresh usage total for the current investigation."""
+        _acc_var.set(_Acc())
+
+    def usage_total(self) -> ModelUsage:
+        acc = _acc_var.get()
+        if acc is None:
+            return ModelUsage(0, 0, "")
+        return ModelUsage(acc.tokens_in, acc.tokens_out, acc.model)
+
     async def _cache_get(self, key: str) -> str | None:
         try:
             return await self._cache.get(key)
@@ -129,6 +171,16 @@ class GuardedModel:
             log.warning("model circuit breaker opened after %d failures", self._failures)
         self._trial_in_flight = False
 
+    def _add_usage(self, sink: list[ModelUsage]) -> None:
+        acc = _acc_var.get()
+        if acc is None:
+            acc = _Acc()
+            _acc_var.set(acc)
+        for u in sink:
+            acc.tokens_in += u.tokens_in
+            acc.tokens_out += u.tokens_out
+            acc.model = u.model or acc.model
+
     async def generate(self, system: str, user: str) -> str:
         key = cache_key(system, user)
         cached = await self._cache_get(key)
@@ -145,6 +197,8 @@ class GuardedModel:
                 remaining = self._total_budget_s - (self._clock() - start)
                 if remaining <= 0:
                     break
+                sink: list[ModelUsage] = []
+                _sink_var.set(sink)
                 try:
                     out = await asyncio.wait_for(
                         self._inner.generate(system, user),
@@ -165,6 +219,7 @@ class GuardedModel:
                         await self._sleep(delay)
                     continue
                 settled = True
+                self._add_usage(sink)
                 self._record_success()
                 await self._cache_set(key, out)
                 return out
