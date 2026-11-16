@@ -278,6 +278,13 @@ The one extra request is leftover from an earlier run. The before snapshot was t
 
 Caveats still apply: the demand mix is assumed, the matching uses straight-line distance, and the copilot image now builds but has not been deployed in the cluster.
 
+### C23. Copilot deployed in the cluster; live diagnosis blocked by the free-tier rate limit
+- **Deployed:** the copilot runs in the kind cluster (1/1 Running). Health and metrics respond, and requests without a valid token get 401. The copilot image is built by `deploy.sh`, with the embedding model baked in, because the pod's root filesystem is read-only.
+- **Secrets:** `copilot-env` and `copilot-webhook` were created from the local `.env` without printing values. The API and webhook tokens were partly printed in chat by mistake, so both were rotated.
+- **Bugs found on the way:** (1) the embedding model tried to download at runtime into a read-only filesystem; (2) the default model `gpt-oss-120b` tried a built-in tool call that was not offered, and Groq rejected every request with HTTP 400; (3) Qwen skipped the tools and invented evidence, which the grounding check dropped. Fixed by native tool calling, tolerant parsing, and a Qwen default.
+- **Blocked:** the free tier allows 1,000 output tokens per minute for `qwen/qwen3.8-27b`. One short call uses about 72 output tokens. A full diagnosis makes several calls with tool results fed back in, so it exceeds the limit, and the retries end in the fallback. This is a hard limit of the free tier, not a code fault.
+- **Options, for the owner to choose:** (a) Groq's paid Dev Tier, which raises the limit at a per-token cost; (b) keep the free tier, and accept one diagnosis every minute or so, which makes the 30-50 incident evaluation take hours; (c) try another provider's free tier, which needs testing.
+
 ### C7. Tickets still running at time of writing
 - 1.5 logs loader (Postgres loader with idempotent delete-then-insert per file)
 - 1.6 docs chunking and embedding (Embedder protocol, fake embedder for tests)
