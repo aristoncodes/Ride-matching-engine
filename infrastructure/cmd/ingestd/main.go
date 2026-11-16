@@ -54,6 +54,8 @@ func main() {
 		"admin/pprof listen address (NEVER expose this publicly)")
 	contentionProfile := flag.Bool("contention-profile", false,
 		"enable block+mutex profiling; adds overhead, use only for a profiling run")
+	refreshEvery := flag.Duration("metrics-refresh-interval", metrics.DefaultRefreshInterval,
+		"how often to refresh the driver gauges without waiting for a scrape")
 	flag.Parse()
 
 	// JSON lines, not text: the copilot's DP-1 loader parses these into Postgres,
@@ -136,6 +138,8 @@ func main() {
 			logger.Error("pipeline stopped", "err", err)
 		}
 	}()
+
+	go metrics.RefreshDriverGauge(ctx, store, *refreshEvery, logger)
 
 	reaperDone := store.StartReaper(ctx, *reapEvery, func(removed int, err error) {
 		switch {

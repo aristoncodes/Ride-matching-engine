@@ -46,6 +46,8 @@ func main() {
 		"admin/pprof listen address (NEVER expose this publicly)")
 	contentionProfile := flag.Bool("contention-profile", false,
 		"enable block+mutex profiling; adds overhead, use only for a profiling run")
+	refreshEvery := flag.Duration("metrics-refresh-interval", metrics.DefaultRefreshInterval,
+		"how often to refresh the queue gauges without waiting for a scrape")
 	flag.Parse()
 
 	// JSON lines, not text: the copilot's DP-1 loader parses these into Postgres,
@@ -132,6 +134,8 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	go metrics.RefreshStreamGauges(ctx, q, *refreshEvery, logger)
 
 	go func() {
 		logger.Info("requestd listening", "addr", *addr, "tenant", *tenant)
