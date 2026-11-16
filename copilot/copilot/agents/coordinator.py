@@ -141,6 +141,45 @@ def _prompt(name: str) -> str:
     return (PROMPTS / f"{name}.md").read_text(encoding="utf-8")
 
 
+_NONE_ACTION = {"kind": "none", "deployment": "none", "replicas": None, "reason": ""}
+_DEPLOYMENTS = ("matching-engine", "batcherd")
+
+
+def _normalise_action(value: Any) -> Any:
+    """Coerce a string proposed_action ("scale batcherd") into the object form.
+    Dicts pass through unchanged; anything unrecognised becomes kind none. Never raises."""
+    if isinstance(value, dict):
+        return value
+    none = dict(_NONE_ACTION)
+    if not isinstance(value, str):
+        return none
+    parts = value.lower().split()
+    if len(parts) != 2:
+        return none
+    verb, dep = parts
+    if dep not in _DEPLOYMENTS:
+        return none
+    if verb == "scale":
+        kind = "scale"
+    elif verb in ("restart", "restart_pods"):
+        kind = "restart_pods"
+    else:
+        return none
+    return {"kind": kind, "deployment": dep, "replicas": None, "reason": ""}
+
+
+def _parse_diagnosis(text: str) -> Diagnosis:
+    """Diagnosis.model_validate_json with proposed_action normalised first."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return Diagnosis.model_validate_json(text)
+    if isinstance(data, dict):
+        data["proposed_action"] = _normalise_action(data.get("proposed_action"))
+        return Diagnosis.model_validate(data)
+    return Diagnosis.model_validate_json(text)
+
+
 def _strip_fences(text: str) -> str:
     t = text.strip()
     m = re.match(r"^```[a-zA-Z]*\s*\n?(.*?)\n?```\s*$", t, re.DOTALL)
@@ -513,7 +552,7 @@ async def _coordinate(
             trace.append(_coord_step(trace, t0, "unavailable"))
             return InvestigationResult(None, evidence, trace, critic_enabled=critic)
         try:
-            diagnosis = Diagnosis.model_validate_json(_strip_fences(out))
+            diagnosis = _parse_diagnosis(_strip_fences(out))
         except ValidationError as exc:
             trace.append(_coord_step(trace, t0, "invalid"))
             user += (
@@ -595,7 +634,7 @@ async def _criticize(
         trace.append(_coord_step(trace, t0, "unavailable"))
         raise
     try:
-        revised = Diagnosis.model_validate_json(_strip_fences(out))
+        revised = _parse_diagnosis(_strip_fences(out))
     except ValidationError:
         trace.append(_coord_step(trace, t0, "invalid"))
         return _escalate(draft, verdict.unsupported_claim_indexes)

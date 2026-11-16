@@ -1,4 +1,11 @@
-"""Groq ModelClient (OpenAI-compatible chat completions).
+"""OpenAI-compatible ModelClient for Groq or a local Ollama server.
+
+The same client serves Groq (free tier, rate-limited) and a local Ollama server (no limits,
+slower), selected by LLM_BASE_URL. The default is Groq. A base URL anywhere else, such as
+http://localhost:11434/v1 or http://host.docker.internal:11434/v1, is treated as a local
+server: no Authorization header is sent and no API key is required. Set the model name in
+GROQ_MODEL (for example qwen2.5:3b for Ollama). A local server may answer 500 while a model
+is loading; that raises like any 5xx so GuardedModel retries.
 
 Replaces Vertex AI (Gemini) per owner decision: Groq has a free tier, Vertex does not.
 Groq has no embedding model, so embeddings run locally (see copilot.embed.LocalEmbedder).
@@ -7,7 +14,7 @@ Free-tier rate limits apply per model; tokens-per-minute (TPM) is the binding co
 not requests-per-minute. Exceeding it returns HTTP 429, which is raised here so GuardedModel
 retries with backoff and eventually falls back. Check current limits on the Groq console.
 
-The API key is read from GROQ_API_KEY at call time and never appears in logs or errors.
+For Groq, the API key is read from GROQ_API_KEY at call time and never appears in logs or errors.
 Prompts and outputs are never logged.
 
 Default model is qwen/qwen3.8-27b: openai/gpt-oss-120b, called with no tools offered, emits
@@ -25,7 +32,7 @@ import httpx
 from copilot.agents.model import ChatResult, ModelUsage, ToolCall, record_usage
 
 DEFAULT_MODEL = "qwen/qwen3.8-27b"
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 TIMEOUT_S = 30.0
 
 
@@ -44,9 +51,13 @@ class GroqClient:
         return res.text
 
     async def chat(self, messages: list[dict], tools: list[dict] | None = None) -> ChatResult:
-        key = os.environ.get("GROQ_API_KEY", "").strip()
-        if not key:
-            raise RuntimeError("GROQ_API_KEY is not set; the Groq model client is unavailable")
+        base = (os.environ.get("LLM_BASE_URL") or "").strip().rstrip("/") or GROQ_BASE_URL
+        headers: dict[str, str] = {}
+        if httpx.URL(base).host == httpx.URL(GROQ_BASE_URL).host:
+            key = os.environ.get("GROQ_API_KEY", "").strip()
+            if not key:
+                raise RuntimeError("GROQ_API_KEY is not set; the Groq model client is unavailable")
+            headers["Authorization"] = f"Bearer {key}"
         model = self._model or os.environ.get("GROQ_MODEL") or DEFAULT_MODEL
         payload: dict = {"model": model, "messages": messages, "temperature": 0}
         if tools:
@@ -54,7 +65,7 @@ class GroqClient:
             payload["tool_choice"] = "auto"
         async with httpx.AsyncClient(timeout=TIMEOUT_S, transport=self._transport) as client:
             resp = await client.post(
-                GROQ_URL, json=payload, headers={"Authorization": f"Bearer {key}"}
+                base + "/chat/completions", json=payload, headers=headers
             )
         # 429 / 5xx raise HTTPStatusError so GuardedModel retries. The message holds only the
         # status and URL, never the request headers.

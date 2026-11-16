@@ -401,3 +401,36 @@ def test_bad_arguments_go_back_as_error_not_raise():
     s["metrics"] = [ev("metric", "queue_depth@15m", "queue_depth=5")]
     r = asyncio.run(run(BadArgs(s)))
     assert "metric" not in _evidence_kinds(r)
+
+
+@pytest.mark.parametrize(
+    "raw,kind,dep",
+    [
+        ("scale batcherd", "scale", "batcherd"),
+        ("  Scale   BATCHERD ", "scale", "batcherd"),
+        ("none", "none", "none"),
+        ("", "none", "none"),
+        ("restart_pods matching-engine", "restart_pods", "matching-engine"),
+        ("restart batcherd", "restart_pods", "batcherd"),
+        ("reboot the world", "none", "none"),
+        ("scale redis", "none", "none"),
+        (None, "none", "none"),
+    ],
+)
+def test_normalise_action_strings(raw, kind, dep):
+    out = co._normalise_action(raw)
+    assert out["kind"] == kind and out["deployment"] == dep
+    assert out["replicas"] is None and out["reason"] == ""
+
+
+def test_normalise_action_dict_unchanged():
+    d = {"kind": "scale", "deployment": "batcherd", "replicas": 3, "reason": "x"}
+    assert co._normalise_action(d) is d
+
+
+def test_string_proposed_action_yields_valid_diagnosis():
+    data = json.loads(diag())
+    data["proposed_action"] = "scale batcherd"
+    d = co._parse_diagnosis(json.dumps(data))
+    assert d.proposed_action.kind == "scale"
+    assert d.proposed_action.deployment == "batcherd"

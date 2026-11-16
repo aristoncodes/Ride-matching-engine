@@ -126,3 +126,59 @@ def test_chat_bad_arguments_do_not_raise(monkeypatch: pytest.MonkeyPatch, bad: s
     )
     res = asyncio.run(client.chat([], TOOLS))
     assert res.tool_calls[0].arguments == {} and res.tool_calls[0].error
+
+
+LOCAL = "http://localhost:11434/v1"
+
+
+def test_groq_url_sends_bearer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GROQ_API_KEY", FAKE_KEY)
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, json=CANNED)
+
+    asyncio.run(GroqClient(transport=httpx.MockTransport(handler)).chat([]))
+    assert seen["url"] == "https://api.groq.com/openai/v1/chat/completions"
+    assert seen["auth"] == f"Bearer {FAKE_KEY}"
+
+
+def test_local_base_url_no_auth_no_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setenv("LLM_BASE_URL", LOCAL + "/")  # trailing slash must not double the path
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["headers"] = dict(request.headers)
+        return httpx.Response(200, json=CANNED)
+
+    out = asyncio.run(GroqClient(transport=httpx.MockTransport(handler)).generate("s", "u"))
+    assert out == "hello"
+    assert seen["url"] == LOCAL + "/chat/completions"
+    assert "authorization" not in seen["headers"]
+
+
+def test_local_server_500_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setenv("LLM_BASE_URL", LOCAL)
+    client = GroqClient(transport=httpx.MockTransport(lambda r: httpx.Response(500)))
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(client.generate("s", "u"))
+
+
+def test_local_base_url_parses_tool_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setenv("LLM_BASE_URL", LOCAL)
+    client = GroqClient(
+        transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, json=_tool_resp('{"name": "queue_depth"}'))
+        )
+    )
+    res = asyncio.run(client.chat([], TOOLS))
+    assert [(t.name, t.arguments) for t in res.tool_calls] == [
+        ("query_metric", {"name": "queue_depth"})
+    ]
