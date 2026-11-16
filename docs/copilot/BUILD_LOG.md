@@ -239,6 +239,24 @@ An independent read-only review (Opus) of the agents, critic, actions and API fo
 - Detection lead time is not recorded anywhere yet, so that PRD metric stays "not measured".
 - Recall@5 is computed from a separate search on the diagnosis text, not from the retrieval the agent actually used.
 
+### C21. Bengaluru pipeline load test (first real run)
+Setup: the kind cluster was rebuilt from current code (`./k8s/deploy.sh --rebuild`), because the old images predated the logging and gauge changes. Load generator: `-mode pipeline -region bengaluru`, at 50 requests per second.
+
+| Run | Drivers connected | Ride requests accepted | Request latency p50 / p99 |
+|---|---|---|---|
+| Small | 319 of 500 | 200 of 200 | 1.41 ms / 12.3 ms |
+| Large | 981 of 1000 | 1000 of 1000 | 1.47 ms / 6.0 ms |
+
+Batcher totals, summed across both pods and cumulative since the last restart: 1,299 requests processed, 1,280 matched (about 98.5%), 19 unmatched, 0 dead-lettered, 0 solve errors. Queue depth returned to 0.
+
+**Caveats, to be honest about in an interview:**
+- Driver connections failed in bursts: 181 of 500 in one run, 19 of 1000 in another. Probes at 150 and 400 had no failures; 300 had 8. The load tester discards the dial error, so the cause is unconfirmed. The most likely cause is the burst of simultaneous connections through the kind port mapping. Fixing that means ramping the dials, or printing the error to find the real cause.
+- Matched and unmatched counts are cumulative across all runs since the batcher pods started, not per run. Per-run matching needs a reset between runs.
+- The demand mix (hotspot weights) is an assumption, not measured Bengaluru ride data.
+- Matching uses straight-line distance, so the match times don't reflect road travel.
+- The copilot and Prometheus pods were not running: the copilot image has not been built, and Prometheus and Alertmanager were still starting. The copilot is not in this measurement.
+- Reports are written to the local scratchpad, not to the repo.
+
 ### C7. Tickets still running at time of writing
 - 1.5 logs loader (Postgres loader with idempotent delete-then-insert per file)
 - 1.6 docs chunking and embedding (Embedder protocol, fake embedder for tests)
