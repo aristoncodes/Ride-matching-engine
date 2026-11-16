@@ -22,6 +22,12 @@ RUN uv sync --no-dev
 
 # Run as a non-root user.
 # Numeric UID so Kubernetes can verify runAsNonRoot (matches runAsUser in k8s/base/copilot.yaml).
+# The embedding model is downloaded at build time, not at runtime: the pod's root
+# filesystem is read-only (k8s/base/copilot.yaml), so a first-use download fails.
+ENV FASTEMBED_CACHE_PATH=/opt/fastembed
+RUN /app/.venv/bin/python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5')" \
+    && chmod -R a+rX /opt/fastembed
+
 RUN groupadd --system --gid 10001 copilot \
     && useradd --system --uid 10001 --gid 10001 --home /app copilot \
     && chown -R 10001:10001 /app

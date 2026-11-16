@@ -13,7 +13,7 @@ set -euo pipefail
 CLUSTER=ride-matching
 NS=ride-matching
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGES=(ride-matching/engine:dev ride-matching/ingestd:dev ride-matching/requestd:dev ride-matching/batcherd:dev)
+IMAGES=(ride-matching/engine:dev ride-matching/ingestd:dev ride-matching/requestd:dev ride-matching/batcherd:dev ride-matching/copilot:dev)
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31mfatal:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -41,6 +41,8 @@ kubectl config use-context "kind-$CLUSTER" >/dev/null
 if [[ "${1:-}" == "--rebuild" ]] || ! docker image inspect "${IMAGES[0]}" >/dev/null 2>&1; then
   log "building images"
   (cd "$ROOT" && docker compose build)
+  # The copilot is not in compose.yaml, so it is built from its own Dockerfile.
+  docker build -q -t ride-matching/copilot:dev -f "$ROOT/copilot/Dockerfile" "$ROOT/copilot" >/dev/null
 fi
 
 # kind nodes have their own image store; a locally-built image is invisible to
