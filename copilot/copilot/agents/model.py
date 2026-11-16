@@ -157,6 +157,4 @@ class GuardedModel:
             return out
 
         self._record_failure(trial)
-        raise ModelUnavailable(
-            f"model failed after {attempts} attempts: {type(last).__name__}"
-        )
+        raise ModelUnavailable(f"model failed after {attempts} attempts: {type(last).__name__}")

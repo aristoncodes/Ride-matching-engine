@@ -29,8 +29,7 @@ METRIC_QUERIES: dict[str, str] = {
         "histogram_quantile(0.99, sum by (le) (rate(ridematch_solve_seconds_bucket[5m])))"
     ),
     "match_latency_p99": (
-        "histogram_quantile(0.99, "
-        "sum by (le) (rate(ridematch_match_latency_seconds_bucket[5m])))"
+        "histogram_quantile(0.99, sum by (le) (rate(ridematch_match_latency_seconds_bucket[5m])))"
     ),
     "match_rate": 'sum(rate(ridematch_riders_total{outcome="matched"}[1m]))',
     "http_5xx_ratio": (
