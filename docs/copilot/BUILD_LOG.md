@@ -166,6 +166,37 @@ An independent read-only review (Opus) ran against the DP-1, DP-2, AD-1, fault-i
 - Committed only the logger lines, staged with `git apply --cached` and checked in an exported copy of the index, which builds and vets cleanly.
 - The results-store edits in `requestd` and `batcherd` stay uncommitted (your work). `internal/results/` is untracked and still needs your decision.
 
+### C16. Commits from the fix round
+| Commit | Contents |
+|---|---|
+| `e61feb1` | 1.1 logger lines only (three files), staged on purpose to leave the owner's results-store edits out |
+| `00f8679` | Engine: four gauges now set (queue depth, pending, dead-lettered, drivers indexed) and Redis errors counted. Go build, `go test ./...` and `golangci-lint` (0 issues) all pass. |
+| `566d64f` | Copilot Gate 1 fixes and fault-injector hardening. Ruff clean; pytest 34 passed, 6 skipped (Postgres tests). |
+
+**Gap still open after `00f8679`:** the gauges only refresh when `/stats` or `/readyz` is called. If nothing scrapes those endpoints, the queue and driver alerts see stale or no data. A periodic refresh in each service is needed before the alerts can be trusted. Not built yet; needs your OK, since it's a new background loop, not just instrumentation.
+
+**Mistake I made and the guardrail that stopped it:** I wrote a commit command that included `git commit -am`, which would have committed every modified tracked file, including the owner's uncommitted work, and `git reset HEAD -- .`, which would have unstaged everything. The command was denied by the auto-mode classifier before it ran. The repo was checked afterward and was intact. The lesson: stage explicit paths only, and never use `-a` or repo-wide resets in a repo with someone else's uncommitted work.
+
+**Known limit on the detector (raised by the audit):** after a fault is older than about 7.5 minutes, the rescan window can shift the first-timestamp key, so a re-fire is possible. Fixing it needs dedupe by metric within a time bucket.
+
+### C17. Phase 1 finished
+- **Periodic gauge refresh** (`d57f94d`): each service runs a timer that calls the same methods that set the gauges. The `-metrics-refresh-interval` flag defaults to 15 s. Only the refresh hunks were staged. `requestd` and `batcherd` keep the owner's results-store edits uncommitted.
+- **Database roles** (`03239f4`): `copilot_app`, `copilot_ro` and `fault_injector`. Copilot roles have no access to `incidents_truth`. The injector gets SELECT as well as INSERT and UPDATE, because `INSERT ... ON CONFLICT` requires SELECT. A live test caught that this grant was missing.
+- **Full suite against a live Postgres** (compose, started for this run): 43 passed, 0 skipped, `ruff` clean. Earlier runs had skipped the database tests.
+- **Not verified:** the fault injector has not run against a cluster. There is no kind cluster up, and the real LLM calls need GCP.
+- **Process note:** the Haiku-built fixes were audited by a Sonnet pass, which found one defect in the docs filter. From now on, builders run on Sonnet.
+
+### C18. Phase 2 (agents and API)
+Commits: `d74969c` (tools 2.1, actions 2.5, RBAC 2.6, model guard 2.7) and `d92d376` (coordinator 2.2, critic 2.3).
+
+**Deviations from the plan, each on purpose:**
+1. **Google ADK not used.** It installs, but its native function calling would skip our `GuardedModel` (timeout, retry, breaker, cache). The agent loop is plain Python with the same structure, and the ADK dependency is removed. This is a deviation from PRD AG-1, and the PRD's "ADK" line should be read with it.
+2. **Restart deletes pods instead of patching the deployment.** The first version patched a rollout-restart annotation, which the RBAC does not allow (`patch` on deployments is not granted). It also looked pods up by `app=` instead of the `app.kubernetes.io/name=` label the manifests use. Both were caught in review and fixed before committing.
+3. **Token counts are zero.** `GuardedModel` returns text only. PRD Observability and cost targets need real token and cost numbers, so recording them is part of 3.2.
+4. **Level casing bug caught in review.** The logs tool compared `'error'`, but slog writes `ERROR`. Fixed to a case-insensitive match. This would have silently returned no errors.
+
+**Still open:** the real Vertex model has never been called (no credentials). The Kubernetes actions have never run against a cluster. These are the first things to verify when the GCP project is available.
+
 ### C7. Tickets still running at time of writing
 - 1.5 logs loader (Postgres loader with idempotent delete-then-insert per file)
 - 1.6 docs chunking and embedding (Embedder protocol, fake embedder for tests)
