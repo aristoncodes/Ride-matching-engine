@@ -13,7 +13,7 @@ from pathlib import Path
 import asyncpg
 import pytest
 
-from copilot.embed import Embedder, FakeEmbedder, VertexEmbedder
+from copilot.embed import Embedder, FakeEmbedder, LocalEmbedder
 from copilot.ingest.docs import chunk_markdown, index_docs, is_indexable, select_docs
 
 FIXTURE = """# Guide
@@ -117,16 +117,9 @@ def test_fake_embedder_is_deterministic_and_normalised() -> None:
         assert math.isclose(sum(x * x for x in v), 1.0, rel_tol=1e-9)
 
 
-def test_vertex_settings_read_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    from copilot.embed import _vertex_settings
-
-    monkeypatch.delenv("VERTEX_PROJECT", raising=False)
-    monkeypatch.setenv("VERTEX_LOCATION", "us-central1")
-    with pytest.raises(RuntimeError, match="VERTEX_PROJECT"):
-        _vertex_settings()
-    monkeypatch.setenv("VERTEX_PROJECT", "test-proj")
-    assert _vertex_settings() == ("test-proj", "us-central1")
-    assert VertexEmbedder.dim == 768
+def test_local_embedder_dim_matches_schema() -> None:
+    assert LocalEmbedder.dim == 384
+    assert FakeEmbedder().dim == 384
 
 
 @pytest.mark.pg
@@ -145,7 +138,7 @@ async def test_index_docs_replaces_chunks(tmp_path: Path) -> None:
             await conn.execute(schema.read_text(encoding="utf-8"))
             await conn.execute("DELETE FROM doc_chunks")
 
-        emb = FakeEmbedder(dim=768)
+        emb = FakeEmbedder()
         first = await index_docs(pool, emb, tmp_path)
         second = await index_docs(pool, emb, tmp_path)
         assert first == second == 4 + 2  # a.md: 4 headings; b.md: 2 headings

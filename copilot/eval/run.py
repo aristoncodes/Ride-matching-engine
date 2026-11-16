@@ -50,7 +50,7 @@ INJECTOR_ENV = (
 REQUIRED = {
     "EVAL_TRUTH_DSN": "Postgres DSN for the incidents_truth reader (owner or fault_injector role)",
     "COPILOT_RO_DSN": "DSN for the copilot_ro role (agent reads)",
-    "VERTEX_PROJECT": "Vertex AI project for the model and embedder",
+    "GROQ_API_KEY": "Groq API key for the model",
     "PGHOST": "libpq host for the fault injector's ground-truth writes",
     "PGUSER": "libpq user for the fault injector",
     "PGDATABASE": "libpq database for the fault injector",

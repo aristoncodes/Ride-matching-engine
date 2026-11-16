@@ -37,8 +37,8 @@ from pydantic import BaseModel, Field, model_validator
 from copilot.actions import k8s
 from copilot.actions.k8s import ActionError
 from copilot.agents.coordinator import investigate
+from copilot.agents.groq import DEFAULT_MODEL
 from copilot.agents.tools.runbook_tools import search_runbook
-from copilot.agents.vertex import DEFAULT_MODEL
 from copilot.cost import cost_usd
 from copilot.models import Diagnosis
 from copilot.obs import metrics
@@ -230,7 +230,7 @@ async def _run(deps: AppDeps, incident_id: str, req: DiagnoseRequest) -> Diagnos
                 fallback = await _fallback(deps, evidence, trigger, "action proposal failed")
 
     elapsed = time.monotonic() - t0
-    model_id = model_id or os.environ.get("VERTEX_MODEL", DEFAULT_MODEL)
+    model_id = model_id or os.environ.get("GROQ_MODEL", DEFAULT_MODEL)
     cost = cost_usd(model_id, tokens_in, tokens_out)
     metrics.MODEL_TOKENS.labels("in").inc(tokens_in)
     metrics.MODEL_TOKENS.labels("out").inc(tokens_out)

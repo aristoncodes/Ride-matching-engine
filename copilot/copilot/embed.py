@@ -1,16 +1,14 @@
-"""Embedding backends: a Protocol, a Vertex AI implementation, and a fake for tests."""
+"""Embedding backends: a Protocol, a local fastembed implementation, and a fake for tests."""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import math
-import os
 from typing import Any, Protocol, runtime_checkable
 
-VERTEX_MODEL = "text-embedding-005"
-VERTEX_DIM = 768
-VERTEX_BATCH = 64
+LOCAL_MODEL = "BAAI/bge-small-en-v1.5"
+LOCAL_DIM = 384
 
 
 @runtime_checkable
@@ -24,46 +22,32 @@ def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _vertex_settings() -> tuple[str, str]:
-    """Read Vertex project and location from the environment at call time."""
-    project = os.environ.get("VERTEX_PROJECT", "").strip()
-    location = os.environ.get("VERTEX_LOCATION", "").strip()
-    if not project or not location:
-        raise RuntimeError(
-            "VERTEX_PROJECT and VERTEX_LOCATION must be set to use the Vertex embedder"
-        )
-    return project, location
+class LocalEmbedder:
+    """Local fastembed model (free; replaces Vertex text-embedding-005 per owner decision).
 
+    Groq has no embedding model. bge-small-en-v1.5 gives 384-dim vectors. fastembed is
+    synchronous, so the call runs in a thread. In-memory sha256-keyed cache.
+    """
 
-def _load_vertex() -> tuple[Any, Any]:
-    try:
-        import vertexai
-        from vertexai.language_models import TextEmbeddingModel
-    except ImportError as exc:
-        raise RuntimeError(
-            "google-cloud-aiplatform is not installed. Run `uv add google-cloud-aiplatform`."
-        ) from exc
-    return vertexai, TextEmbeddingModel
+    dim: int = LOCAL_DIM
 
-
-class VertexEmbedder:
-    """text-embedding-005 via google-cloud-aiplatform, with an in-memory sha256-keyed cache."""
-
-    dim: int = VERTEX_DIM
-
-    def __init__(self, model_name: str = VERTEX_MODEL, timeout_s: float = 10.0) -> None:
+    def __init__(self, model_name: str = LOCAL_MODEL) -> None:
         self._model_name = model_name
-        self._timeout_s = timeout_s
         self._model: Any = None
         self._cache: dict[str, list[float]] = {}
 
     def _get_model(self) -> Any:
         if self._model is None:
-            project, location = _vertex_settings()
-            vertexai, text_model_cls = _load_vertex()
-            vertexai.init(project=project, location=location)
-            self._model = text_model_cls.from_pretrained(self._model_name)
+            try:
+                from fastembed import TextEmbedding
+            except ImportError as exc:
+                raise RuntimeError("fastembed is not installed. Run `uv add fastembed`.") from exc
+            self._model = TextEmbedding(model_name=self._model_name)
         return self._model
+
+    def _embed_sync(self, texts: list[str]) -> list[list[float]]:
+        model = self._get_model()
+        return [[float(v) for v in vec] for vec in model.embed(texts)]
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         keys = [_sha256(t) for t in texts]
@@ -71,24 +55,11 @@ class VertexEmbedder:
         for key, text in zip(keys, texts, strict=True):
             if key not in self._cache:
                 pending.setdefault(key, text)
-
         items = list(pending.items())
         if items:
-            model = self._get_model()
-            for start in range(0, len(items), VERTEX_BATCH):
-                batch = items[start : start + VERTEX_BATCH]
-                try:
-                    results = await asyncio.wait_for(
-                        asyncio.to_thread(model.get_embeddings, [t for _, t in batch]),
-                        timeout=self._timeout_s,
-                    )
-                except TimeoutError as exc:
-                    raise RuntimeError(
-                        f"Vertex embedding call timed out after {self._timeout_s:g}s"
-                    ) from exc
-                for (key, _), result in zip(batch, results, strict=True):
-                    self._cache[key] = [float(v) for v in result.values]
-
+            vecs = await asyncio.to_thread(self._embed_sync, [t for _, t in items])
+            for (key, _), vec in zip(items, vecs, strict=True):
+                self._cache[key] = vec
         return [list(self._cache[k]) for k in keys]
 
 
@@ -111,7 +82,7 @@ def _hash_vector(text: str, dim: int) -> list[float]:
 class FakeEmbedder:
     """Deterministic, hash-based, unit-normalised vectors. For tests only."""
 
-    def __init__(self, dim: int = 8) -> None:
+    def __init__(self, dim: int = 384) -> None:
         self.dim = dim
 
     async def embed(self, texts: list[str]) -> list[list[float]]:

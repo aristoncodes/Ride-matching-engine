@@ -5,6 +5,7 @@ Importing this module has no side effects (unlike copilot.api.app, which builds 
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -26,14 +27,19 @@ async def build_agent_components() -> AgentComponents:
     import httpx
 
     from copilot import db
+    from copilot.agents.groq import GroqClient
     from copilot.agents.model import GuardedModel, RedisCache
-    from copilot.agents.vertex import VertexClient
-    from copilot.embed import VertexEmbedder
+    from copilot.embed import LocalEmbedder
+
+    if not os.environ.get("GROQ_API_KEY", "").strip():
+        logging.getLogger(__name__).warning(
+            "GROQ_API_KEY is not set; /diagnose will use the fallback response"
+        )
 
     return AgentComponents(
         pool_ro=await db.connect(os.environ["COPILOT_RO_DSN"]),
         prom_client=httpx.AsyncClient(timeout=10.0),
         prom_base_url=os.environ.get("PROMETHEUS_URL", DEFAULT_PROMETHEUS_URL),
-        embedder=VertexEmbedder(),
-        guarded_model=GuardedModel(VertexClient(), cache=RedisCache()),
+        embedder=LocalEmbedder(),
+        guarded_model=GuardedModel(GroqClient(), cache=RedisCache()),
     )

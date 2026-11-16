@@ -159,7 +159,7 @@ async def test_runbook_search_sql_and_output():
     assert "copilot/" in sql and "NOT LIKE" in sql
     assert "{" not in sql
     assert args[1] == 3
-    assert args[0].startswith("[") and len(args[0].strip("[]").split(",")) == 8
+    assert args[0].startswith("[") and len(args[0].strip("[]").split(",")) == 384
     assert out == [
         {
             "source_file": "docs/Runbook.md",

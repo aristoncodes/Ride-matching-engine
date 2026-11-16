@@ -26,7 +26,7 @@ class UsageInner:
 
     async def generate(self, system, user):
         self.n += 1
-        record_usage(ModelUsage(100, 10, "gemini-2.5-flash"))
+        record_usage(ModelUsage(100, 10, "openai/gpt-oss-120b"))
         return f"answer-{self.n}"
 
 
@@ -41,11 +41,11 @@ def test_tokens_accumulate_and_reset():
         await m.generate("s", "a")
         await m.generate("s", "b")
         await m.generate("s", "a")  # cache hit: no new usage
-        assert m.usage_total() == ModelUsage(200, 20, "gemini-2.5-flash")
+        assert m.usage_total() == ModelUsage(200, 20, "openai/gpt-oss-120b")
         m.reset_usage()
         assert m.usage_total().tokens_in == 0
         await m.generate("s", "c")
-        assert m.usage_total() == ModelUsage(100, 10, "gemini-2.5-flash")
+        assert m.usage_total() == ModelUsage(100, 10, "openai/gpt-oss-120b")
 
     asyncio.run(go())
 
@@ -65,7 +65,7 @@ def test_cost_arithmetic(monkeypatch):
     assert cost.cost_usd("m-test", 1_000_000, 500_000) == pytest.approx(3.0)
     assert cost.cost_usd("m-test", 0, 0) == 0
     # unknown model falls back to the default row
-    fin, fout = cost.PRICES_USD_PER_M[cost.FALLBACK_MODEL]
+    fin, fout = cost.FALLBACK_PRICE
     assert cost.cost_usd("nope", 1_000_000, 1_000_000) == pytest.approx(fin + fout)
 
 
@@ -76,11 +76,11 @@ async def test_metrics_open_and_incidents_get_tokens_and_cost(env):  # noqa: F81
     assert r.status_code == 200
     assert "copilot_diagnoses_total" in r.text
     state["result"] = InvestigationResult(
-        diagnosis(), tokens_in=1_000_000, tokens_out=100_000, model="gemini-2.5-flash"
+        diagnosis(), tokens_in=1_000_000, tokens_out=100_000, model="openai/gpt-oss-120b"
     )
     assert (await c.post("/diagnose", json=BODY, headers=AUTH)).status_code == 200
     args = pool.updates()[0][1]
-    fin, fout = cost.PRICES_USD_PER_M["gemini-2.5-flash"]
+    fin, fout = cost.PRICES_USD_PER_M["openai/gpt-oss-120b"]
     assert args[4] == 1_000_000 and args[5] == 100_000
     assert args[8] == pytest.approx(fin + 0.1 * fout)
     text = (await c.get("/metrics")).text

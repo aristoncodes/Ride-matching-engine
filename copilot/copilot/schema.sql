@@ -16,6 +16,8 @@ CREATE INDEX IF NOT EXISTS logs_request_id_idx ON logs (request_id);
 
 CREATE EXTENSION IF NOT EXISTS vector;
 
+-- NOTE: changing the embedding dimension requires re-creating doc_chunks on an existing
+-- database (CREATE TABLE IF NOT EXISTS will not alter it), then re-indexing the docs.
 CREATE TABLE IF NOT EXISTS doc_chunks (
   id           bigserial PRIMARY KEY,
   source_file  text NOT NULL,           -- e.g. docs/Runbook.md
@@ -23,7 +25,7 @@ CREATE TABLE IF NOT EXISTS doc_chunks (
   heading      text NOT NULL,
   content      text NOT NULL,
   content_hash text NOT NULL,           -- file hash, for DP-3
-  embedding    vector(768) NOT NULL     -- text-embedding-005 dims (assumption, §6)
+  embedding    vector(384) NOT NULL     -- BAAI/bge-small-en-v1.5 dims (local fastembed)
 );
 CREATE INDEX IF NOT EXISTS doc_chunks_embedding_idx ON doc_chunks USING hnsw (embedding vector_cosine_ops);
 
