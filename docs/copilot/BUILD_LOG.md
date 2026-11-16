@@ -223,6 +223,22 @@ An independent read-only review (Opus) of the agents, critic, actions and API fo
 
 **Test status after the fixes:** `ruff` clean; 137 passed, 0 skipped, with the compose Postgres up.
 
+### C20. Phase 3 status
+| Ticket | Status | Commit |
+|---|---|---|
+| 3.1 evaluation harness | Built. Plumbing checked with a dry run. **Not run**: needs a live model, a cluster and the truth DSN. | `d74fb01` |
+| 3.2 tracing, tokens, cost, metrics | Built and tested. Token field names and prices are **unverified** against the live Vertex API. | `9dd02b8` |
+| 3.3 GCP deploy | **Blocked**: needs GCP project ID, Vertex region, `gcloud` installed and signed in, and a budget cap. | none |
+| 3.4 Isolation Forest (P1) | **Not started**: the PRD allows it only after every P0 item passes with measured numbers. | none |
+| 3.5 README and resume bullets | **Not started**: needs measured results. | none |
+
+**What the numbers will and will not show:** nothing is measured yet. The harness has never produced a result row, so there are no accuracy, recall, latency or cost figures. The resume bullets must wait for those figures.
+
+**Known caveats to carry into the evaluation:**
+- The model guard caches answers in Redis. Critic-on and critic-off runs must flush that cache, or the latency and cost comparison is skewed.
+- Detection lead time is not recorded anywhere yet, so that PRD metric stays "not measured".
+- Recall@5 is computed from a separate search on the diagnosis text, not from the retrieval the agent actually used.
+
 ### C7. Tickets still running at time of writing
 - 1.5 logs loader (Postgres loader with idempotent delete-then-insert per file)
 - 1.6 docs chunking and embedding (Embedder protocol, fake embedder for tests)
