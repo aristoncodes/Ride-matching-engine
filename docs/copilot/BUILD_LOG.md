@@ -257,6 +257,27 @@ Batcher totals, summed across both pods and cumulative since the last restart: 1
 - The copilot and Prometheus pods were not running: the copilot image has not been built, and Prometheus and Alertmanager were still starting. The copilot is not in this measurement.
 - Reports are written to the local scratchpad, not to the repo.
 
+### C22. Cross-repo bug review, fixes, and a second Bengaluru run
+A read-only review (Opus) of everything since the last gate found 13 high-severity issues and no critical ones. All 13 are fixed in `d282e3b`. The most important:
+- A NaN metric crashed the whole diagnosis. Non-finite values are now rejected.
+- Per-pod gauges were summed, so the reported queue depth scaled with the replica count. They now use max.
+- The z-score floor of 1.0 hid latency and error-rate faults. Each metric now has its own floor, and an absent series counts as a detection.
+- A resolved alert could never be diagnosed again. Its fingerprint is now released.
+- The image could not build, and the pod could not start under `runAsNonRoot`. Both fixed.
+- The copilot's RBAC covered every deployment in the namespace. Narrowed to the two it acts on. Pod delete stays namespace-wide and is documented as a residual risk.
+- Traffic-burst ground truth was recorded even though the load was rejected. The injector now needs the API key, and the load tester exits non-zero when nothing is accepted.
+- The eval's timeout killed the injector with SIGKILL, so its restore trap never ran. It now sends SIGTERM first.
+
+**Bengaluru, second run** (1,000 drivers, 1,000 riders, 50 per second, per-run batcher delta summed across pods):
+- Drivers connected: 1,000 of 1,000, with no retries.
+- Requests accepted: 1,000 of 1,000.
+- Matched: 1,000 of 1,001 processed, a 99.9% match rate. Zero dead-lettered.
+- Median request latency: about 1 ms.
+
+The one extra request is leftover from an earlier run. The before snapshot was taken just before the first, failed attempt, so the delta should be read with that in mind.
+
+Caveats still apply: the demand mix is assumed, the matching uses straight-line distance, and the copilot image now builds but has not been deployed in the cluster.
+
 ### C7. Tickets still running at time of writing
 - 1.5 logs loader (Postgres loader with idempotent delete-then-insert per file)
 - 1.6 docs chunking and embedding (Embedder protocol, fake embedder for tests)
