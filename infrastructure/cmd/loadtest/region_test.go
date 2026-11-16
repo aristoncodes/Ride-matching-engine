@@ -5,6 +5,12 @@ import (
 	"testing"
 )
 
+// near compares coordinates with a tolerance of 1e-9 degrees (about 0.1 mm).
+// Exact float equality failed on CI (amd64) against values generated on arm64,
+// where the last digit differs by rounding. The tolerance is far below any real
+// change to the generator, so the test still catches one.
+func near(a, b float64) bool { return math.Abs(a-b) <= 1e-9 }
+
 func TestCentreUnchanged(t *testing.T) {
 	r := buildBatch(5, 4, 8)
 	wantR := [][2]float64{
@@ -22,13 +28,13 @@ func TestCentreUnchanged(t *testing.T) {
 	}
 	for i, w := range wantR {
 		p := r.Riders[i].Pickup
-		if p.Lat != w[0] || p.Lng != w[1] {
+		if !near(p.Lat, w[0]) || !near(p.Lng, w[1]) {
 			t.Errorf("rider %d = %v,%v want %v", i, p.Lat, p.Lng, w)
 		}
 	}
 	for i, w := range wantD {
 		p := r.CandidateDrivers[i].Location
-		if p.Lat != w[0] || p.Lng != w[1] {
+		if !near(p.Lat, w[0]) || !near(p.Lng, w[1]) {
 			t.Errorf("driver %d = %v,%v want %v", i, p.Lat, p.Lng, w)
 		}
 	}
