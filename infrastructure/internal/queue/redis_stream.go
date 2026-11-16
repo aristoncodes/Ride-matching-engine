@@ -10,6 +10,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/aditya/ride-matching/internal/metrics"
 	"github.com/aditya/ride-matching/internal/redisconn"
 )
 
@@ -131,6 +132,24 @@ func NewRedisStream(addr string, opts StreamOptions) (*RedisStream, error) {
 func (q *RedisStream) streamKey() string { return "requests:stream:" + q.opts.TenantID }
 func (q *RedisStream) deadKey() string   { return "requests:dead:" + q.opts.TenantID }
 
+// countRedisErr records a failed Redis call and returns err unchanged.
+//
+// Without it a Redis stall surfaces only as latency and log lines, with nothing
+// an alert can key on. Cancellation and deadline errors are the caller giving
+// up (shutdown, a short probe timeout), not Redis misbehaving, so counting them
+// would make every deploy look like an outage.
+func countRedisErr(err error) error {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	// A server-side reply (WRONGTYPE, OOM, NOGROUP) will not change on retry;
+	// network and timeout failures are the transient kind.
+	var redisErr redis.Error
+	retryable := !errors.As(err, &redisErr)
+	metrics.DependencyErrorsTotal.WithLabelValues("redis", strconv.FormatBool(retryable)).Inc()
+	return err
+}
+
 // ensureGroup creates the consumer group, tolerating the case where it exists.
 func (q *RedisStream) ensureGroup(ctx context.Context) error {
 	// MKSTREAM creates the stream if absent, so a fresh deployment does not
@@ -188,7 +207,7 @@ func (q *RedisStream) Publish(ctx context.Context, req RideRequest) (string, err
 		},
 	}).Result()
 	if err != nil {
-		return "", fmt.Errorf("queue: publish: %w", err)
+		return "", fmt.Errorf("queue: publish: %w", countRedisErr(err))
 	}
 	return id, nil
 }
@@ -235,7 +254,7 @@ func (q *RedisStream) Consume(ctx context.Context, max int, block time.Duration)
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, err
 		}
-		return nil, fmt.Errorf("queue: consume: %w", err)
+		return nil, fmt.Errorf("queue: consume: %w", countRedisErr(err))
 	}
 
 	var out []Message
@@ -274,7 +293,7 @@ func (q *RedisStream) Reclaim(ctx context.Context, minIdle time.Duration, max in
 		Count:  int64(max),
 	}).Result()
 	if err != nil && !errors.Is(err, redis.Nil) {
-		return nil, fmt.Errorf("queue: xpending: %w", err)
+		return nil, fmt.Errorf("queue: xpending: %w", countRedisErr(err))
 	}
 	if len(pending) == 0 {
 		return nil, nil
@@ -298,7 +317,7 @@ func (q *RedisStream) Reclaim(ctx context.Context, minIdle time.Duration, max in
 		Messages: toClaim,
 	}).Result()
 	if err != nil && !errors.Is(err, redis.Nil) {
-		return nil, fmt.Errorf("queue: xclaim: %w", err)
+		return nil, fmt.Errorf("queue: xclaim: %w", countRedisErr(err))
 	}
 
 	var out []Message
@@ -332,7 +351,7 @@ func (q *RedisStream) Ack(ctx context.Context, ids ...string) error {
 		return nil
 	}
 	if err := q.client.XAck(ctx, q.streamKey(), q.opts.Group, ids...).Err(); err != nil {
-		return fmt.Errorf("queue: ack: %w", err)
+		return fmt.Errorf("queue: ack: %w", countRedisErr(err))
 	}
 	return nil
 }
@@ -366,7 +385,7 @@ func (q *RedisStream) DeadLetter(ctx context.Context, msg Message, reason string
 		pipe.XAck(ctx, q.streamKey(), q.opts.Group, msg.ID)
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
-		return fmt.Errorf("queue: dead-letter: %w", err)
+		return fmt.Errorf("queue: dead-letter: %w", countRedisErr(err))
 	}
 	return nil
 }
@@ -375,10 +394,13 @@ func (q *RedisStream) DeadLetter(ctx context.Context, msg Message, reason string
 func (q *RedisStream) Depth(ctx context.Context) (int64, error) {
 	groups, err := q.client.XInfoGroups(ctx, q.streamKey()).Result()
 	if err != nil {
-		return 0, fmt.Errorf("queue: depth: %w", err)
+		return 0, fmt.Errorf("queue: depth: %w", countRedisErr(err))
 	}
 	for _, g := range groups {
 		if g.Name == q.opts.Group {
+			// Set where the value is computed: every caller (readiness probe,
+			// /stats) refreshes the gauge without a second Redis round trip.
+			metrics.QueueDepth.WithLabelValues(q.opts.TenantID).Set(float64(g.Lag))
 			return g.Lag, nil
 		}
 	}
@@ -392,8 +414,9 @@ func (q *RedisStream) Pending(ctx context.Context) (int64, error) {
 		return 0, nil
 	}
 	if err != nil {
-		return 0, fmt.Errorf("queue: pending: %w", err)
+		return 0, fmt.Errorf("queue: pending: %w", countRedisErr(err))
 	}
+	metrics.QueuePending.WithLabelValues(q.opts.TenantID).Set(float64(res.Count))
 	return res.Count, nil
 }
 
@@ -406,8 +429,9 @@ func (q *RedisStream) DeadLetterDepth(ctx context.Context) (int64, error) {
 		return 0, nil
 	}
 	if err != nil {
-		return 0, fmt.Errorf("queue: dead-letter depth: %w", err)
+		return 0, fmt.Errorf("queue: dead-letter depth: %w", countRedisErr(err))
 	}
+	metrics.QueueDeadLettered.WithLabelValues(q.opts.TenantID).Set(float64(n))
 	return n, nil
 }
 

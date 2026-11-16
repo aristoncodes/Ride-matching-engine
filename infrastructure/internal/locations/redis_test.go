@@ -7,8 +7,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+
 	"github.com/aditya/ride-matching/internal/locations"
-	"github.com/aditya/ride-matching/internal/testutil"
+	"github.com/aditya/ride-matching/internal/metrics"
+	rtestutil "github.com/aditya/ride-matching/internal/testutil"
 )
 
 // clock is an injectable time source, so freshness tests can jump forward
@@ -35,7 +39,7 @@ func (c *clock) Advance(d time.Duration) {
 
 func newRepo(t *testing.T, clk *clock) *locations.RedisRepository {
 	t.Helper()
-	proc := testutil.StartRedis(t)
+	proc := rtestutil.StartRedis(t)
 
 	opts := locations.DefaultOptions()
 	opts.TenantID = "test"
@@ -151,6 +155,9 @@ func TestStaleDriversAreNotReturned(t *testing.T) {
 	// which is exactly why a reaper is needed as well as a read filter.
 	if n, err := repo.Count(ctx); err != nil || n != 2 {
 		t.Fatalf("count = %d (err %v), want 2 — filtering must not delete", n, err)
+	}
+	if g := value(t, metrics.DriversIndexed.WithLabelValues("test")); g != 2 {
+		t.Errorf("drivers_indexed gauge = %v, want 2", g)
 	}
 }
 
@@ -347,7 +354,7 @@ func TestConcurrentUpsertsAreSafe(t *testing.T) {
 func TestSurvivesRedisRestart(t *testing.T) {
 	// Redis going away must be an error, not a hang or a panic — the same
 	// isolation argument as the engine, one dependency down.
-	proc := testutil.StartRedis(t)
+	proc := rtestutil.StartRedis(t)
 
 	opts := locations.DefaultOptions()
 	opts.TenantID = "test"
@@ -519,4 +526,22 @@ func TestNearbyManyHandlesEmptyInput(t *testing.T) {
 	if err != nil || got != nil {
 		t.Errorf("NearbyMany(nil) = %v, %v; want nil, nil", got, err)
 	}
+}
+
+// value reads a collector's current value. Written against client_model rather
+// than prometheus/testutil, which would pull extra modules into go.mod.
+func value(t *testing.T, c prometheus.Collector) float64 {
+	t.Helper()
+	m, ok := c.(prometheus.Metric)
+	if !ok {
+		t.Fatalf("%T is not a single metric", c)
+	}
+	var out dto.Metric
+	if err := m.Write(&out); err != nil {
+		t.Fatalf("read metric: %v", err)
+	}
+	if out.Gauge != nil {
+		return out.Gauge.GetValue()
+	}
+	return out.Counter.GetValue()
 }
