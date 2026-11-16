@@ -53,7 +53,9 @@ func main() {
 		"enable block+mutex profiling; adds overhead, use only for a profiling run")
 	flag.Parse()
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// JSON lines, not text: the copilot's DP-1 loader parses these into Postgres,
+	// and text lines can't be split reliably once a message contains spaces or quotes.
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
 	// Profiling lives on its own port. See internal/adminserver: importing
