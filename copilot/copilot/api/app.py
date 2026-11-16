@@ -549,18 +549,17 @@ def build_default_app() -> FastAPI:
     )
 
     async def startup(d: AppDeps) -> None:
-        import httpx
-
         from copilot import db
-        from copilot.agents.model import GuardedModel, RedisCache
-        from copilot.agents.vertex import VertexClient
-        from copilot.embed import VertexEmbedder
+        from copilot.api.components import build_agent_components
 
         d.pool_app = await db.connect(os.environ["COPILOT_DB_DSN"])
-        d.pool_ro = await db.connect(os.environ["COPILOT_RO_DSN"])
-        d.prom_client = httpx.AsyncClient(timeout=10.0)
-        d.embedder = VertexEmbedder()
-        d.guarded_model = GuardedModel(VertexClient(), cache=RedisCache())
+        c = await build_agent_components()
+        d.pool_ro, d.prom_client, d.embedder, d.guarded_model = (
+            c.pool_ro,
+            c.prom_client,
+            c.embedder,
+            c.guarded_model,
+        )
         d.k8s_api = await asyncio.to_thread(k8s.KubernetesActions)
 
     return create_app(deps, startup)
