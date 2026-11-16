@@ -103,8 +103,10 @@ func main() {
 				fmt.Fprintf(w, "%s\t?\t%v\t\t\n", id, err)
 				continue
 			}
+			now := time.Now()
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
-				k.KeyID, k.Name, status(k), k.CreatedAt.Format(time.DateOnly), expiry(k))
+				k.KeyID, k.Name, status(k, now),
+				k.CreatedAt.Format(time.DateOnly), expiry(k, now))
 		}
 		_ = w.Flush()
 
@@ -139,22 +141,62 @@ func main() {
 	}
 }
 
-func status(k *auth.APIKey) string {
-	switch {
-	case !k.RevokedAt.IsZero():
-		return "revoked"
-	case !k.ExpiresAt.IsZero() && k.ExpiresAt.Before(time.Now()):
-		return "expired"
-	default:
+// status describes a key as an operator needs to see it.
+//
+// It defers to auth.APIKey.Active for the active/inactive decision rather than
+// re-deriving it, because a display that disagrees with enforcement is worse
+// than no display at all — and it did disagree.
+//
+// The bug this fixes: Rotate sets RevokedAt to a FUTURE time (now + overlap),
+// which is the entire mechanism of a zero-downtime rotation — the old key goes
+// on working until then. The previous implementation branched on
+// `!RevokedAt.IsZero()` and so printed "revoked" the instant a rotation
+// started. An operator following the documented rotation flow would run
+// `keyadmin list`, see the old key as revoked while clients were still happily
+// authenticating with it, and conclude either that the migration was finished
+// (it was not) or that they had just broken production (they had not).
+//
+// Hence a distinct "rotating" state: still valid, revocation already
+// scheduled. That is a real and temporary condition, and it is precisely the
+// one an operator mid-rotation is looking at.
+func status(k *auth.APIKey, now time.Time) string {
+	if k.Active(now) {
+		if !k.RevokedAt.IsZero() {
+			return "rotating"
+		}
 		return "active"
 	}
+	// Inactive. Report WHY, and check revocation first: a key that was revoked
+	// and has also since passed its natural expiry was revoked deliberately,
+	// which is the more useful fact.
+	if !k.RevokedAt.IsZero() && !now.Before(k.RevokedAt) {
+		return "revoked"
+	}
+	return "expired"
 }
 
-func expiry(k *auth.APIKey) string {
-	if k.ExpiresAt.IsZero() {
+// expiry is when the key stops working, whichever deadline comes first.
+//
+// A pending revocation is shown in preference to a natural expiry when it
+// lands sooner, because during a rotation that IS the deadline that matters —
+// the one the operator is racing to move clients before. Showing an expiry a
+// year out while the key dies in 24 hours is a display that reads as safe and
+// is not.
+func expiry(k *auth.APIKey, now time.Time) string {
+	deadline := k.ExpiresAt
+	if !k.RevokedAt.IsZero() && (deadline.IsZero() || k.RevokedAt.Before(deadline)) {
+		deadline = k.RevokedAt
+	}
+	if deadline.IsZero() {
 		return "never"
 	}
-	return k.ExpiresAt.Format(time.DateOnly)
+	// Minute precision once the deadline is inside a day: a rotation overlap
+	// is measured in hours, and a date alone cannot tell you whether it lapses
+	// this morning or tonight.
+	if !now.After(deadline) && deadline.Sub(now) < 24*time.Hour {
+		return deadline.Format("2006-01-02 15:04")
+	}
+	return deadline.Format(time.DateOnly)
 }
 
 func envOr(key, fallback string) string {

@@ -63,7 +63,19 @@ go run ./cmd/mockdrivers --url ws://localhost:8080/v1/drivers/stream \
   --drivers 200 --interval 1s --duration 60s
 ```
 
-Then submit again and watch it match:
+Then submit again and read the outcome back:
+
+```bash
+REQ=$(curl -s -X POST localhost:8081/v1/ride-requests \
+  -H 'Content-Type: application/json' \
+  -d '{"rider_id":"R-2","pickup":{"lat":12.9716,"lng":77.5946}}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["request_id"])')
+
+sleep 4                                       # one 3s matching window
+curl -s localhost:8081/v1/ride-requests/$REQ
+# {"request_id":"req_...","status":"MATCHED",
+#  "match":{"driver_id":"D-042","straight_line_meters":812.5},"attempts":1}
+```
 
 ```bash
 curl -s localhost:8082/stats     # batcherd: batches, matched, queue depth
@@ -109,13 +121,34 @@ That works because the engine is a separate process (a crash is an error value,
 not a dead service), requests live in a durable stream, and **a request is acked
 only after it is matched**.
 
+### A match is an answer, not just a computation
+
+Optimal assignment is worth nothing to a rider who cannot find out the result.
+`POST /v1/ride-requests` returns a `request_id`; `GET /v1/ride-requests/{id}`
+returns `PENDING`, then `MATCHED` with the driver, or `UNMATCHED` with the
+reason the search was given up on.
+
+The states are only the ones the system can actually reach. An earlier draft of
+the contract also advertised `BATCHED` and `CANCELLED`; neither was ever
+emitted, and a status a client can branch on but never receive is a contract
+that lies, so they were removed rather than left aspirational.
+
+Recording happens **before** the ack, and that ordering is the property. Acking
+first and crashing would lose the match with no trace of it anywhere; recording
+first and crashing merely redelivers the request, which is re-matched and
+overwrites the record — at-least-once doing exactly what it is for.
+
 ### Tenants are genuinely isolated
 
 The tenant comes from the authenticated API key and **never** from the request.
 `internal/tenancy` is a test suite written from the attacker's side: one client
 holding tenant A's key tries to spoof a header, read a competitor's drivers,
-consume their queue, and read their dead-letter stream — and is denied at every
-layer.
+consume their queue, read their dead-letter stream, and fetch a competitor's
+match result by its exact id — and is denied at every layer.
+
+That last one answers **404, never 403**, deliberately: a 403 confirms the id is
+real, which is the disclosure. "Not yours" and "not a thing" have to be
+indistinguishable from outside.
 
 ---
 
@@ -199,6 +232,7 @@ infrastructure/      Go services
   internal/batcher   the matcher microservice
   internal/locks     TTL leases, geohash-partitioned
   internal/auth      API keys, rotation, rate limiting
+  internal/results   terminal outcomes: the answer the rider reads back
   internal/tenancy   cross-tenant isolation suite
   cmd/               ingestd · requestd · batcherd · loadtest · mockdrivers
 

@@ -38,6 +38,7 @@ import (
 	"github.com/aditya/ride-matching/internal/locations"
 	"github.com/aditya/ride-matching/internal/pipeline"
 	"github.com/aditya/ride-matching/internal/queue"
+	"github.com/aditya/ride-matching/internal/results"
 	"github.com/aditya/ride-matching/internal/testutil"
 )
 
@@ -579,5 +580,120 @@ func TestCrossTenantAccessIsDeniedAtEveryLayer(t *testing.T) {
 
 	for _, a := range attacks {
 		t.Run(a.name, a.run)
+	}
+}
+
+// The READ path's half of the isolation property.
+//
+// Week 19 proved a client cannot WRITE into another tenant's queue or READ
+// another tenant's drivers. The outcome store is a new place where one
+// tenant's data sits under an id the other might guess, so it needs the same
+// treatment — a match result names a driver and is exactly the kind of
+// commercial information a competitor would want.
+//
+// The assertion is 404, not 403. A 403 would confirm the id is real, which
+// tells an attacker enumerating ids precisely what they came to learn; "not
+// yours" and "not a thing" have to be indistinguishable from outside.
+func TestOneTenantCannotReadAnothersMatchResult(t *testing.T) {
+	addr, store, keyA, keyB := twoTenants(t)
+	ctx := context.Background()
+
+	outcomes, err := results.NewRedis(addr, results.Options{TTL: time.Hour})
+	if err != nil {
+		t.Fatalf("results store: %v", err)
+	}
+	t.Cleanup(func() { _ = outcomes.Close() })
+
+	// Tenant B has a matched ride. Both tenants use the SAME request id, which
+	// is the adversarial case: isolation must come from the key layout, not
+	// from ids happening never to collide.
+	const sharedID = "req_deadbeef"
+	if err := outcomes.Put(ctx, results.Outcome{
+		RequestID: sharedID, TenantID: tenantB,
+		Status: results.StatusMatched, DriverID: "B-SECRET-DRIVER",
+		StraightLineMeters: 900,
+	}); err != nil {
+		t.Fatalf("seed B outcome: %v", err)
+	}
+
+	qa := newQueue(t, addr, tenantA, "a")
+	cfg := api.DefaultConfig()
+	cfg.Keys = store
+	cfg.Results = outcomes
+	cfg.Logger = quiet()
+	srv, err := api.NewServer(qa, cfg)
+	if err != nil {
+		t.Fatalf("server: %v", err)
+	}
+	h := srv.Routes()
+
+	readAs := func(t *testing.T, key string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/v1/ride-requests/"+sharedID, nil)
+		req.Header.Set("X-API-Key", key)
+		// Claiming to be tenant B, as the write-path attack does. The header
+		// is not a real input on either path.
+		req.Header.Set("X-Tenant-ID", tenantB)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// The attack: tenant A's key, tenant B's request id.
+	rec := readAs(t, keyA)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("DENIED-CHECK FAILED: status = %d, want 404. body: %s",
+			rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "B-SECRET-DRIVER") {
+		t.Fatalf("CROSS-TENANT LEAK: a competitor's driver assignment was "+
+			"returned: %s", rec.Body.String())
+	}
+
+	// The control. Without this the test would still pass if the endpoint were
+	// simply broken for everyone, which proves nothing about isolation.
+	owner := readAs(t, keyB)
+	if owner.Code != http.StatusOK {
+		t.Fatalf("tenant B cannot read its OWN request: status = %d, body: %s",
+			owner.Code, owner.Body.String())
+	}
+	if !strings.Contains(owner.Body.String(), "B-SECRET-DRIVER") {
+		t.Errorf("tenant B's own result is missing its driver: %s", owner.Body.String())
+	}
+}
+
+// An unauthenticated read must be refused before it reaches the store at all —
+// the same rule the write path already follows.
+func TestReadingAResultWithoutAKeyIsRejected(t *testing.T) {
+	addr, store, _, _ := twoTenants(t)
+
+	outcomes, err := results.NewRedis(addr, results.Options{TTL: time.Hour})
+	if err != nil {
+		t.Fatalf("results store: %v", err)
+	}
+	t.Cleanup(func() { _ = outcomes.Close() })
+
+	if err := outcomes.Put(context.Background(), results.Outcome{
+		RequestID: "req_open", TenantID: tenantA,
+		Status: results.StatusMatched, DriverID: "A-DRIVER",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	cfg := api.DefaultConfig()
+	cfg.Keys = store
+	cfg.Results = outcomes
+	cfg.Logger = quiet()
+	srv, _ := api.NewServer(newQueue(t, addr, tenantA, "a"), cfg)
+
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec,
+		httptest.NewRequest(http.MethodGet, "/v1/ride-requests/req_open", nil))
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "A-DRIVER") {
+		t.Fatal("an unauthenticated read returned a driver assignment")
 	}
 }

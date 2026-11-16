@@ -253,6 +253,24 @@ jobs:
           echo "response: $(cat /tmp/resp)"
           [ "$code" = "202" ] || { echo "expected 202, got $code"; exit 1; }
 
+          # The request must be READABLE BACK. Before the results store this
+          # was impossible: the batcher acked a matched request and discarded
+          # the assignment, so the endpoint the OpenAPI contract has always
+          # documented could not be implemented. Asserting it here keeps the
+          # contract and the code from drifting apart again.
+          rid=$(python3 -c 'import json,sys; print(json.load(open("/tmp/resp"))["request_id"])')
+          status=$(curl -s "localhost:8081/v1/ride-requests/$rid" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
+          [ "$status" = "PENDING" ] || { echo "status was $status, want PENDING"; exit 1; }
+          echo "submitted request is readable as PENDING"
+
+          # An unknown id is a 404 — which only MEANS anything because the
+          # accept path records PENDING. Without that write a real, queued
+          # request would 404 too and the code would be meaningless.
+          missing=$(curl -s -o /dev/null -w '%{http_code}' \
+            localhost:8081/v1/ride-requests/req_definitelynotreal)
+          [ "$missing" = "404" ] || { echo "unknown id returned $missing, want 404"; exit 1; }
+
           # A malformed request must be a 4xx, never a 500 — the Week 11
           # checkpoint, enforced on every commit.
           bad=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
