@@ -32,3 +32,4 @@ packages = ["copilot"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["pg: needs Postgres+pgvector at COPILOT_TEST_DSN"]
