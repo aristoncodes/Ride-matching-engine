@@ -379,12 +379,31 @@ func runPipeline(wsURL, restURL, apiKey string, numDrivers, numRiders, rate int,
 
 	cancel()
 
+	if reason := pipelineFailure(connected.Load(), accepted.Load()); reason != "" {
+		defer func() {
+			fmt.Fprintln(os.Stderr, reason)
+			os.Exit(2)
+		}()
+	}
+
 	if outPath != "" {
 		writePipelineReport(outPath, numDrivers, numRiders, rate,
 			connected.Load(), refused.Load(), connectLatency.stats(), reqStats,
 			rampDuration, submitDuration, reg)
 		fmt.Printf("report written to %s\n", outPath)
 	}
+}
+
+// pipelineFailure returns a one-line reason when a pipeline run achieved nothing
+// (no driver connected, or no ride request accepted), else "". main exits 2 on it.
+func pipelineFailure(connected, accepted int64) string {
+	switch {
+	case connected == 0:
+		return "loadtest: no drivers connected; check -ws, -key and that ingestd is reachable"
+	case accepted == 0:
+		return "loadtest: no ride requests accepted; check -rest and -key"
+	}
+	return ""
 }
 
 // ---------------------------------------------------------------------------

@@ -252,7 +252,8 @@ inject() {
       # separate hold is needed. Its output goes to a file, not stdout.
       # The binary was built in preflight, so a failed build never reaches here.
       local riders=$(( BURST_RATE * BURST_SECONDS ))
-      "$WORK/loadtest" --mode=pipeline --ws "$WS" --rest "$REST" \
+      # The key is passed via the environment (loadtest reads RIDEMATCH_API_KEY), never as an argument.
+      RIDEMATCH_API_KEY="$RIDEMATCH_API_KEY" "$WORK/loadtest" --mode=pipeline --ws "$WS" --rest "$REST" \
         --drivers "$BURST_DRIVERS" --riders "$riders" --rate "$BURST_RATE" \
         > "$WORK/loadtest.log" 2>&1
       ;;
@@ -269,6 +270,8 @@ kubectl -n "$NS" get deployment >/dev/null 2>&1 \
   || die "cannot reach the ride-matching namespace; is the stack deployed? (./k8s/deploy.sh)"
 if [[ "$FAULT" == "traffic_burst" ]]; then
   command -v go >/dev/null 2>&1 || die "go is required to build cmd/loadtest for traffic_burst"
+  [[ -n "${RIDEMATCH_API_KEY:-}" ]] \
+    || die "RIDEMATCH_API_KEY is required for traffic_burst; no fault injected"
   WORK=$(mktemp -d)
   (cd "$ROOT/infrastructure" && go build -o "$WORK/loadtest" ./cmd/loadtest) \
     || die "go build of cmd/loadtest failed; no fault injected"

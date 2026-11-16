@@ -25,7 +25,7 @@ import logging
 import os
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -48,6 +48,7 @@ log = logging.getLogger("copilot.api")
 DIAGNOSE_TIMEOUT_S = 60.0
 RATE_LIMIT = 30
 RATE_WINDOW_S = 60.0
+RATE_MAX_KEYS = 10_000
 MAX_CONCURRENT_DIAGNOSES = 4
 MISSING_TOKEN_MSG = "COPILOT_API_TOKEN is required to start the copilot API; set it and retry."
 MISSING_WEBHOOK_MSG = (
@@ -262,15 +263,18 @@ async def _run(deps: AppDeps, incident_id: str, req: DiagnoseRequest) -> Diagnos
 class _RateLimiter:
     def __init__(self, clock: Callable[[], float]) -> None:
         self._clock = clock
-        self._hits: dict[str, deque[float]] = {}
+        self._hits: OrderedDict[str, deque[float]] = OrderedDict()
 
     def check(self, key: str) -> float | None:
         """Record a hit. Return seconds to wait if over the limit, else None."""
         now = self._clock()
-        if len(self._hits) > 10_000:  # bad-token guessing creates keys; drop idle ones
-            for k in [k for k, v in self._hits.items() if not v or now - v[-1] >= RATE_WINDOW_S]:
-                del self._hits[k]
-        q = self._hits.setdefault(key, deque())
+        q = self._hits.get(key)
+        if q is None:
+            q = self._hits[key] = deque()
+            while len(self._hits) > RATE_MAX_KEYS:  # LRU: evict the oldest key, O(1)
+                self._hits.popitem(last=False)
+        else:
+            self._hits.move_to_end(key)
         while q and now - q[0] >= RATE_WINDOW_S:
             q.popleft()
         if len(q) >= RATE_LIMIT:
@@ -309,14 +313,19 @@ def create_app(
                 "route=%s status=%d latency_ms=%d", path, status, (time.monotonic() - t0) * 1000
             )
 
-    def _throttle(request: Request) -> str:
-        """Rate-limit every request, valid token or not, keyed on client address plus a hash
-        of the presented token, so guessing is throttled. Returns the presented token."""
+    def _throttle(request: Request, is_valid: Callable[[str], bool]) -> str:
+        """Rate-limit every request. A request with a valid credential is keyed on client plus a
+        hash of that token (only a few valid tokens exist, so the key space is bounded). Every
+        failed attempt shares ONE bucket per client address, so guessing many different tokens
+        cannot buy a fresh budget per guess. Returns the presented token."""
         header = request.headers.get("authorization", "")
         scheme, _, token = header.partition(" ")
         token = token if scheme.lower() == "bearer" else ""
         client = request.client.host if request.client else "unknown"
-        key = client + ":" + hashlib.sha256(token.encode()).hexdigest()
+        if is_valid(token):
+            key = "ok:" + client + ":" + hashlib.sha256(token.encode()).hexdigest()
+        else:
+            key = "fail:" + client
         wait = limiter.check(key)
         if wait is not None:
             raise HTTPException(
@@ -331,16 +340,17 @@ def create_app(
         return bool(expected) and hmac.compare_digest(token.encode(), expected.encode())
 
     async def auth(request: Request) -> None:
-        if not _matches(_throttle(request), deps.api_token):
+        if not _matches(_throttle(request, lambda t: _matches(t, deps.api_token)), deps.api_token):
             raise _unauthorized()
 
     async def webhook_auth(request: Request) -> None:
-        if not _matches(_throttle(request), deps.webhook_token):
+        tok = _throttle(request, lambda t: _matches(t, deps.webhook_token))
+        if not _matches(tok, deps.webhook_token):
             raise _unauthorized()
 
     async def approver_auth(request: Request) -> str:
         """Return the approver's name. No credential: 401. Not an approver token: 403."""
-        token = _throttle(request)
+        token = _throttle(request, lambda t: any(_matches(t, v) for v in deps.approvers.values()))
         if not token:
             raise _unauthorized()
         found: str | None = None
@@ -368,7 +378,9 @@ def create_app(
         incident_id = await _create_incident(deps, req)
         return await _run(deps, incident_id, req)
 
-    # fingerprint -> incident_id for incidents still open (running, diagnosed, needs_human).
+    # fingerprint -> incident_id for incidents still being diagnosed (status running). Removed
+    # when the diagnosis finishes (any status) or the alert resolves, so a later firing opens a
+    # new investigation.
     # Alertmanager re-sends still-firing alerts every repeat_interval. This map is in memory and
     # PER PROCESS: it is lost on restart and not shared between replicas, so a restart or a
     # second replica can open a duplicate incident. 'failed' incidents are removed so a later
@@ -380,7 +392,12 @@ def create_app(
     async def alerts(body: dict) -> dict:
         ids: list[str] = []
         for alert in body.get("alerts") or []:
-            if not isinstance(alert, dict) or alert.get("status") != "firing":
+            if not isinstance(alert, dict):
+                continue
+            if alert.get("status") == "resolved":
+                open_alerts.pop(_fingerprint(alert), None)  # a later firing starts a new incident
+                continue
+            if alert.get("status") != "firing":
                 continue
             fp = _fingerprint(alert)
             existing = open_alerts.get(fp)
@@ -479,7 +496,7 @@ def create_app(
         try:
             async with sem:  # excess diagnoses wait here; none are dropped
                 res = await _run(d, incident_id, req)
-            if res.status == "failed":
+            if res.status in ("failed", "diagnosed", "needs_human"):
                 open_alerts.pop(fp, None)
         except Exception as exc:  # noqa: BLE001 - background task: record, never crash the loop
             log.error("background diagnose failed: %s", type(exc).__name__)

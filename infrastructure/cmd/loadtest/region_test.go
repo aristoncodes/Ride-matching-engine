@@ -93,3 +93,15 @@ func TestHotspotWeightsSumToOne(t *testing.T) {
 		t.Error("expected error")
 	}
 }
+
+func TestPipelineFailure(t *testing.T) {
+	if got := pipelineFailure(0, 5); got == "" {
+		t.Error("connected=0 must fail")
+	}
+	if got := pipelineFailure(5, 0); got == "" {
+		t.Error("accepted=0 must fail")
+	}
+	if got := pipelineFailure(5, 5); got != "" {
+		t.Errorf("healthy run must pass, got %q", got)
+	}
+}

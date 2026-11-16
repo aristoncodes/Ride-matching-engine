@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -238,6 +239,8 @@ class _Specialist:
 
 
 def _has_number(excerpt: str, value: float) -> bool:
+    if not math.isfinite(value):
+        return False
     forms = {repr(value), f"{value:g}", f"{value:.6g}"}
     if value == int(value):
         forms.add(str(int(value)))

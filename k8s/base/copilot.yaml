@@ -64,6 +64,8 @@ spec:
           # Read-only root, so anything the app writes goes to /tmp below.
           securityContext:
             runAsNonRoot: true
+            runAsUser: 10001   # matches the Dockerfile user
+            runAsGroup: 10001
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
             capabilities: { drop: ["ALL"] }

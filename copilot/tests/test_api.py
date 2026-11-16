@@ -325,14 +325,64 @@ async def test_bad_token_is_rate_limited(env):
 
 
 async def test_duplicate_firing_alert_deduped(env):
-    app, c, pool, *_ = env
+    app, c, pool, state, _ = env
+    gate = asyncio.Event()
+
+    async def slow_investigate(trigger, **kw):
+        await gate.wait()
+        return state["result"]
+
+    app_mod.investigate = slow_investigate  # env's monkeypatch restores the original
     body = {"alerts": [firing("A", "same")]}
+    first = (await c.post("/alerts", json=body, headers=WEBHOOK)).json()["incident_ids"]
+    second = (await c.post("/alerts", json=body, headers=WEBHOOK)).json()["incident_ids"]
+    assert second == first  # still running: the re-send is deduped
+    gate.set()
+    await asyncio.gather(*list(app.state.tasks))
+    assert len(pool.inserts("incidents_seen")) == 1
+
+
+async def test_resolved_then_firing_starts_new_incident(env):
+    app, c, pool, *_ = env
+    body = {"alerts": [firing("A", "cycle")]}
+    first = (await c.post("/alerts", json=body, headers=WEBHOOK)).json()["incident_ids"]
+    await asyncio.gather(*list(app.state.tasks))  # diagnosed
+    resolved = {"alerts": [{"status": "resolved", "fingerprint": "cycle", "labels": {}}]}
+    assert (await c.post("/alerts", json=resolved, headers=WEBHOOK)).status_code == 202
+    second = (await c.post("/alerts", json=body, headers=WEBHOOK)).json()["incident_ids"]
+    await asyncio.gather(*list(app.state.tasks))
+    assert second != first
+    assert len(pool.inserts("incidents_seen")) == 2
+
+
+async def test_diagnosed_alert_refires_without_resolve(env):
+    app, c, pool, *_ = env
+    body = {"alerts": [firing("A", "refire")]}
     first = (await c.post("/alerts", json=body, headers=WEBHOOK)).json()["incident_ids"]
     await asyncio.gather(*list(app.state.tasks))
     second = (await c.post("/alerts", json=body, headers=WEBHOOK)).json()["incident_ids"]
-    assert second == first
-    assert len(pool.inserts("incidents_seen")) == 1
-    assert not app.state.tasks
+    await asyncio.gather(*list(app.state.tasks))
+    assert second != first
+
+
+async def test_many_random_tokens_one_address_throttled(env):
+    _, c, *_ = env
+    codes = []
+    for _ in range(40):
+        h = {"Authorization": f"Bearer random-{uuid.uuid4()}"}
+        codes.append((await c.get("/incidents/" + str(uuid.uuid4()), headers=h)).status_code)
+    assert codes[:30] == [401] * 30
+    assert set(codes[30:]) == {429}
+    # a valid token has its own bucket and is not locked out by the failures
+    assert (await c.get("/incidents/" + str(uuid.uuid4()), headers=AUTH)).status_code == 404
+
+
+async def test_rate_limiter_is_bounded_lru():
+    lim = app_mod._RateLimiter(lambda: 0.0)
+    for i in range(app_mod.RATE_MAX_KEYS + 500):
+        lim.check(f"k{i}")
+    assert len(lim._hits) == app_mod.RATE_MAX_KEYS
+    assert "k0" not in lim._hits and f"k{app_mod.RATE_MAX_KEYS + 499}" in lim._hits
 
 
 async def test_failed_incident_allows_retry(env):

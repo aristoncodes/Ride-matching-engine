@@ -285,3 +285,19 @@ def test_partial_evidence_on_timeout():
     assert r.diagnosis is None
     assert _evidence_kinds(r) == ["metric", "doc"]
     assert [e.id for e in r.evidence] == ["E1", "E2"]
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_has_number_non_finite_is_false_and_never_raises(bad):
+    assert co._has_number("queue_depth=nan", bad) is False
+    assert co._has_number("value=inf", bad) is False
+
+
+def test_non_finite_metric_values_do_not_ground_evidence():
+    role = co.RoleRunner.__new__(co.RoleRunner) if hasattr(co, "RoleRunner") else None
+    if role is None:
+        pytest.skip("RoleRunner not exposed")
+    role.role = "metrics"
+    role.metric_values = {"solve_p99@15m": [float("nan"), float("inf")]}
+    item = {"kind": "metric", "ref": "solve_p99@15m", "excerpt": "p99=nan then inf"}
+    assert role._grounded(item) == "excerpt lacks a returned value"

@@ -215,7 +215,7 @@ data:
 
           # Driver pool collapsed: ingestion stopped or TTL reaping everything.
           - alert: DriversIndexedLow
-            expr: ridematch_drivers_indexed < 10
+            expr: ridematch_drivers_indexed < 10 or absent(ridematch_drivers_indexed)
             for: 5m
             labels:
               severity: critical

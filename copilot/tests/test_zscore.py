@@ -110,6 +110,7 @@ def test_to_diagnose_payload_shape() -> None:
             "last_ts": 2.0,
             "peak_z": 4.5,
             "value_at_detection": 99.0,
+            "reason": "zscore",
         },
     }
 
@@ -168,7 +169,7 @@ def test_prometheus_url_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_fetch_series_parses_and_sums_matrix() -> None:
+async def test_fetch_series_parses_matrix() -> None:
     seen: dict[str, object] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -193,12 +194,12 @@ async def test_fetch_series_parses_and_sums_matrix() -> None:
 
     assert seen["path"] == "/api/v1/query_range"
     assert seen["params"] == {
-        "query": "ridematch_queue_depth",
+        "query": "max by (tenant) (ridematch_queue_depth)",
         "start": "90.0",
         "end": "120.0",
         "step": "15",
     }
-    assert points == [(100.0, 3.5), (115.0, 4.0)]
+    assert points == [(100.0, 2.5), (115.0, 4.0)]
 
 
 @pytest.mark.asyncio
@@ -209,3 +210,52 @@ async def test_fetch_series_raises_on_prometheus_error() -> None:
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(RuntimeError, match="bad query"):
             await fetch_series(client, "http://prom:9090", "up", 0.0, 1.0, 15)
+
+
+def test_gauge_promql_uses_max_by_tenant() -> None:
+    assert AD1_QUERIES["queue_depth"] == "max by (tenant) (ridematch_queue_depth)"
+    assert AD1_QUERIES["queue_pending"] == "max by (tenant) (ridematch_queue_pending)"
+    assert AD1_QUERIES["queue_dead_lettered"] == "max by (tenant) (ridematch_queue_dead_lettered)"
+    assert AD1_QUERIES["drivers_indexed"] == "max by (tenant) (ridematch_drivers_indexed)"
+    assert AD1_QUERIES["dependency_errors"].startswith("sum(rate(")
+
+
+@pytest.mark.asyncio
+async def test_fetch_series_takes_max_across_series() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        result = [
+            {"metric": {"pod": "a"}, "values": [[100, "7"], [115, "3"]]},
+            {"metric": {"pod": "b"}, "values": [[100, "7"], [115, "5"]]},
+            {"metric": {"pod": "c"}, "values": [[100, "7"]]},
+        ]
+        return httpx.Response(200, json={"status": "success", "data": {"result": result}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        points = await fetch_series(client, "http://prom:9090", "q", 0.0, 1.0, 15)
+    assert points == [(100.0, 7.0), (115.0, 5.0)]
+
+
+def test_slow_solver_step_in_seconds_fires() -> None:
+    values = _noisy(0.05, 30, amp=0.002) + [2.0] * 10
+    events = detect({"solve_p99": _series(values)})
+    assert [e.metric for e in events] == ["solve_p99"]
+
+
+def test_redis_error_rate_step_fires() -> None:
+    values = [0.0] * 30 + [2.0] * 10
+    events = detect({"dependency_errors": _series(values)})
+    assert [e.metric for e in events] == ["dependency_errors"]
+
+
+@pytest.mark.asyncio
+async def test_run_once_emits_absent_event_for_empty_series(monkeypatch) -> None:
+    async def fake_fetch(client, base_url, promql, start, end, step):
+        if promql == AD1_QUERIES["drivers_indexed"]:
+            return []
+        return _series([10.0] * 40)
+
+    monkeypatch.setattr(zscore, "fetch_series", fake_fetch)
+    seen: set = set()
+    events = await run_once("http://prom:9090", seen=seen)
+    assert [(e.metric, e.reason) for e in events] == [("drivers_indexed", "absent")]
+    assert await run_once("http://prom:9090", seen=seen) == []  # reported once

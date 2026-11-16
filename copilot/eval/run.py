@@ -34,6 +34,8 @@ FAULTS = tuple(scoring.EXPECTED_COMPONENT)
 INJECTOR = ROOT / "k8s" / "fault-inject.sh"
 RESULTS_DIR = HERE / "results"
 INVESTIGATE_TIMEOUT_S = 60.0
+INJECTOR_WAIT_S = 600
+INJECTOR_TERM_GRACE_S = 30
 TRIGGER = {
     "question": (
         "Something may be wrong with the ride-matching system right now. "
@@ -45,7 +47,7 @@ INJECTOR_ENV = (
     "PATH", "HOME", "USER", "TMPDIR", "KUBECONFIG", "GOPATH", "GOCACHE", "GOFLAGS",
     "PGHOST", "PGPORT", "PGUSER", "PGDATABASE", "PGPASSWORD", "PGPASSFILE", "PGSSLMODE",
     "FAULT_HOLD_SECONDS", "SETTLE_SECONDS", "BURST_RATE", "BURST_SECONDS", "BURST_DRIVERS",
-    "SLOW_CPU_LIMIT",
+    "SLOW_CPU_LIMIT", "RIDEMATCH_API_KEY",
 )  # fmt: skip
 REQUIRED = {
     "EVAL_TRUTH_DSN": "Postgres DSN for the incidents_truth reader (owner or fault_injector role)",
@@ -77,6 +79,38 @@ def start_injector(fault: str) -> subprocess.Popen:
     return subprocess.Popen(  # noqa: S603
         args, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
+
+
+def stop_injector(proc: subprocess.Popen) -> int:
+    """SIGTERM first so the injector's EXIT trap restores the cluster; SIGKILL after a grace."""
+    proc.terminate()
+    try:
+        return proc.wait(INJECTOR_TERM_GRACE_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return proc.wait()
+
+
+async def mark_injection_failed(since: datetime) -> None:
+    """Tag this run's truth row like the injector does. Best effort; never raises."""
+    dsn = os.environ.get("EVAL_TRUTH_DSN", "").strip()
+    if not dsn:
+        return
+    try:
+        import asyncpg
+
+        conn = await asyncpg.connect(dsn)
+        try:
+            await conn.execute(
+                "UPDATE incidents_truth SET expected_runbook = NULL, "
+                "target = target || ' [injection_failed]' "
+                "WHERE start_time >= $1 AND target NOT LIKE '%[injection_failed]%'",
+                since,
+            )
+        finally:
+            await conn.close()
+    except Exception as exc:  # noqa: BLE001
+        print(f"could not mark truth row injection_failed: {type(exc).__name__}", file=sys.stderr)
 
 
 async def one_run(fault: str, critic: str, comps, window_s: float, settle_s: float) -> dict:
@@ -119,11 +153,14 @@ async def one_run(fault: str, critic: str, comps, window_s: float, settle_s: flo
     tin = result.tokens_in if result else 0
     tout = result.tokens_out if result else 0
     model = result.model if result else ""
+    injection_failed = False
     try:
-        injector_rc = await asyncio.to_thread(proc.wait, 600)
+        injector_rc = await asyncio.to_thread(proc.wait, INJECTOR_WAIT_S)
     except subprocess.TimeoutExpired:
-        proc.kill()
-        injector_rc = -9
+        injector_rc = await asyncio.to_thread(stop_injector, proc)
+        injection_failed = True
+        err = err or "injector_timeout"
+        await mark_injection_failed(window_start)
     window_end = _now()
     await asyncio.sleep(settle_s)
     return {
@@ -132,6 +169,7 @@ async def one_run(fault: str, critic: str, comps, window_s: float, settle_s: flo
         "window_start": window_start.isoformat(),
         "window_end": window_end.isoformat(),
         "injector_rc": injector_rc,
+        "injection_failed": injection_failed,
         "diagnosis": diagnosis.model_dump() if diagnosis else None,
         "needs_human": bool(diagnosis and diagnosis.needs_human),
         "incident_opened": bool(

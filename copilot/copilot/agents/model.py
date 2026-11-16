@@ -18,6 +18,7 @@ from typing import Any, Protocol
 log = logging.getLogger(__name__)
 
 CACHE_TTL_S = 3600
+REDIS_TIMEOUT_S = 1.0
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 
 
@@ -86,7 +87,12 @@ class RedisCache:
         if self._client is None:
             import redis.asyncio as aioredis
 
-            self._client = aioredis.from_url(self._url, decode_responses=True)
+            self._client = aioredis.from_url(
+                self._url,
+                decode_responses=True,
+                socket_timeout=REDIS_TIMEOUT_S,
+                socket_connect_timeout=REDIS_TIMEOUT_S,
+            )
         return self._client
 
     async def get(self, key: str) -> str | None:
@@ -139,14 +145,16 @@ class GuardedModel:
 
     async def _cache_get(self, key: str) -> str | None:
         try:
-            return await self._cache.get(key)
+            return await asyncio.wait_for(self._cache.get(key), timeout=REDIS_TIMEOUT_S)
         except Exception as exc:
             log.warning("model cache get failed: %s", type(exc).__name__)
             return None
 
     async def _cache_set(self, key: str, value: str) -> None:
         try:
-            await self._cache.set(key, value, CACHE_TTL_S)
+            await asyncio.wait_for(
+                self._cache.set(key, value, CACHE_TTL_S), timeout=REDIS_TIMEOUT_S
+            )
         except Exception as exc:
             log.warning("model cache set failed: %s", type(exc).__name__)
 

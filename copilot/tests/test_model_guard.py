@@ -191,3 +191,39 @@ def test_total_budget_stops_retries_early():
         run(m.generate("s", "u"))
     # backoffs 0.5 then 1.0: the third attempt would land at 1.5 > 1.2
     assert inner.calls == 2
+
+
+class HangingCache:
+    async def get(self, key):
+        await asyncio.sleep(3600)
+
+    async def set(self, key, value, ttl_s):
+        await asyncio.sleep(3600)
+
+
+def test_hanging_cache_does_not_block_generate(caplog):
+    inner = FakeInner()
+    m = make(inner, cache=HangingCache())
+
+    async def go():
+        return await asyncio.wait_for(m.generate("s", "u"), timeout=10)
+
+    with caplog.at_level(logging.WARNING):
+        assert run(go()) == "ANSWER-TEXT"
+    assert "TimeoutError" in caplog.text
+    assert "SYSTEM-SECRET" not in caplog.text
+
+
+def test_redis_client_has_socket_timeouts(monkeypatch):
+    import sys
+    import types
+
+    from copilot.agents.model import RedisCache
+
+    seen = {}
+    fake = types.SimpleNamespace(from_url=lambda url, **kw: seen.update(kw) or object())
+    monkeypatch.setitem(sys.modules, "redis", types.SimpleNamespace(asyncio=fake))
+    monkeypatch.setitem(sys.modules, "redis.asyncio", fake)
+    RedisCache("redis://x")._conn()
+    assert seen["socket_timeout"] == 1.0
+    assert seen["socket_connect_timeout"] == 1.0

@@ -11,7 +11,12 @@
 #   pods delete           - restart = delete the pods and let the Deployment
 #                           controller recreate them. No `patch` on
 #                           deployments is needed for that.
-#   deployments get       - read the current replica count so the action can
+#                           RESIDUAL RISK: pod delete is namespace-wide. Pod names
+#                           change, so it cannot be narrowed with resourceNames.
+#                           The allowlist in copilot/actions/k8s.py is the only
+#                           thing limiting which pods the copilot deletes.
+#   deployments get       - (matching-engine and batcherd only, via resourceNames)
+#                           read the current replica count so the action can
 #                           check its bounds and record the "before" value.
 #   deployments/scale     - get reads the current scale, patch sets the new one.
 #                           Using the scale subresource means the copilot cannot
@@ -41,9 +46,11 @@ rules:
     verbs: ["delete"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
+    resourceNames: ["matching-engine", "batcherd"]
     verbs: ["get"]
   - apiGroups: ["apps"]
     resources: ["deployments/scale"]
+    resourceNames: ["matching-engine", "batcherd"]
     verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

@@ -171,3 +171,13 @@ async def test_runbook_search_sql_and_output():
     ]
     assert runbook_tools.SEARCH_SQL == sql
     assert metrics_tools.STEP_SECONDS == 15
+
+
+def test_per_pod_gauges_use_max_not_sum():
+    for name, metric in [
+        ("queue_depth", "ridematch_queue_depth"),
+        ("queue_pending", "ridematch_queue_pending"),
+        ("dead_lettered", "ridematch_queue_dead_lettered"),
+        ("drivers_indexed", "ridematch_drivers_indexed"),
+    ]:
+        assert METRIC_QUERIES[name] == f"max by (tenant) ({metric})"

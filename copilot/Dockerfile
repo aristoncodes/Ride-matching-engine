@@ -14,16 +14,18 @@ ENV UV_COMPILE_BYTECODE=1 \
 WORKDIR /app
 
 # Install dependencies first (cached layer), then the project itself.
-COPY pyproject.toml ./
+COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --no-dev --no-install-project
 
 COPY copilot ./copilot
 RUN uv sync --no-dev
 
 # Run as a non-root user.
-RUN groupadd --system copilot && useradd --system --gid copilot --home /app copilot \
-    && chown -R copilot:copilot /app
-USER copilot
+# Numeric UID so Kubernetes can verify runAsNonRoot (matches runAsUser in k8s/base/copilot.yaml).
+RUN groupadd --system --gid 10001 copilot \
+    && useradd --system --uid 10001 --gid 10001 --home /app copilot \
+    && chown -R 10001:10001 /app
+USER 10001
 
 EXPOSE 8000
 

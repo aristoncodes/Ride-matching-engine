@@ -16,14 +16,15 @@ from statistics import fmean, pstdev
 
 import httpx
 
-PROMQL_QUEUE_DEPTH = "ridematch_queue_depth"
-PROMQL_QUEUE_PENDING = "ridematch_queue_pending"
-PROMQL_QUEUE_DEAD_LETTERED = "ridematch_queue_dead_lettered"
+# Per-pod gauges carry only a tenant label, so every pod exports the same value: max, not sum.
+PROMQL_QUEUE_DEPTH = "max by (tenant) (ridematch_queue_depth)"
+PROMQL_QUEUE_PENDING = "max by (tenant) (ridematch_queue_pending)"
+PROMQL_QUEUE_DEAD_LETTERED = "max by (tenant) (ridematch_queue_dead_lettered)"
 PROMQL_SOLVE_P99 = (
     "histogram_quantile(0.99, sum by (le) (rate(ridematch_solve_seconds_bucket[5m])))"
 )
 PROMQL_DEPENDENCY_ERRORS = "sum(rate(ridematch_dependency_errors_total[1m]))"
-PROMQL_DRIVERS_INDEXED = "ridematch_drivers_indexed"
+PROMQL_DRIVERS_INDEXED = "max by (tenant) (ridematch_drivers_indexed)"
 
 AD1_QUERIES: dict[str, str] = {
     "queue_depth": PROMQL_QUEUE_DEPTH,
@@ -36,8 +37,18 @@ AD1_QUERIES: dict[str, str] = {
 
 DEFAULT_PROMETHEUS_URL = "http://localhost:9090"
 DEFAULT_STEP_SECONDS = 15
+ABSENT_KEY_TS = -1.0  # `seen` key timestamp for a metric with no points
 STD_FLOOR_REL = 0.05  # std is at least 5% of |mean| so flat series do not explode
-STD_FLOOR_ABS = 1.0  # absolute floor for count-like metrics (dead-lettered, drivers)
+STD_FLOOR_ABS = 1.0  # default absolute floor, for count-like metrics
+# Per-metric absolute floors: counts use 1.0, seconds and rates use 0.01.
+STD_FLOOR_ABS_BY_METRIC: dict[str, float] = {
+    "queue_depth": 1.0,
+    "queue_pending": 1.0,
+    "queue_dead_lettered": 1.0,
+    "drivers_indexed": 1.0,
+    "solve_p99": 0.01,
+    "dependency_errors": 0.01,
+}
 
 
 @dataclass(frozen=True)
@@ -47,6 +58,7 @@ class DetectionEvent:
     last_ts: float
     peak_z: float
     value_at_detection: float
+    reason: str = "zscore"
 
 
 def detect(
@@ -58,7 +70,7 @@ def detect(
     """Flag sustained deviations in each series.
 
     A point is scored against the previous `window` points (mean and population
-    std, with std_eff = max(std, 0.05 * |mean|, 1.0)). It is deviant when
+    std, with std_eff = max(std, 0.05 * |mean|, per-metric floor)). It is deviant when
     |z| > z_threshold. An event fires once per run of deviant points, at the point
     where the run reaches `sustain`. Deviant points are not added to the baseline,
     so a sustained anomaly cannot pull the window toward itself. Points before the
@@ -81,6 +93,7 @@ def _detect_one(
     z_threshold: float,
     sustain: int,
 ) -> list[DetectionEvent]:
+    floor_abs = STD_FLOOR_ABS_BY_METRIC.get(metric, STD_FLOOR_ABS)
     history: deque[float] = deque(maxlen=window)
     events: list[DetectionEvent] = []
     run_len = 0
@@ -89,7 +102,7 @@ def _detect_one(
     for ts, value in sorted(points, key=lambda p: p[0]):
         if len(history) == window:
             mean = fmean(history)
-            std = max(pstdev(history), STD_FLOOR_REL * abs(mean), STD_FLOOR_ABS)
+            std = max(pstdev(history), STD_FLOOR_REL * abs(mean), floor_abs)
             z = (value - mean) / std
             if abs(z) > z_threshold:
                 if run_len == 0:
@@ -120,7 +133,7 @@ async def fetch_series(
     end: float,
     step: int,
 ) -> list[tuple[float, float]]:
-    """Run a Prometheus range query; sum all returned series per timestamp.
+    """Run a Prometheus range query; take the max of all returned series per timestamp.
 
     NaN and infinite samples are dropped.
     """
@@ -138,7 +151,7 @@ async def fetch_series(
             value = float(raw_value)
             if math.isfinite(value):
                 ts = float(raw_ts)
-                totals[ts] = totals.get(ts, 0.0) + value
+                totals[ts] = max(totals[ts], value) if ts in totals else value
     return sorted(totals.items())
 
 
@@ -162,11 +175,24 @@ async def run_once(
                 for promql in AD1_QUERIES.values()
             )
         )
-    events = detect(dict(zip(AD1_QUERIES, results, strict=True)))
+    by_metric = dict(zip(AD1_QUERIES, results, strict=True))
+    events = detect({m: pts for m, pts in by_metric.items() if pts})
+    # No points at all (for example ingestd scaled to 0) is a detection, not silence.
+    for metric, pts in by_metric.items():
+        if not pts:
+            events.append(DetectionEvent(metric, end, end, 0.0, 0.0, "absent"))
     if seen is None:
         return events
-    fresh = [e for e in events if (e.metric, e.first_ts) not in seen]
-    seen.update((e.metric, e.first_ts) for e in fresh)
+    fresh = []
+    for e in events:
+        # An absent metric has a stable key so it is reported once until it comes back.
+        key = (e.metric, ABSENT_KEY_TS) if e.reason == "absent" else (e.metric, e.first_ts)
+        if key not in seen:
+            seen.add(key)
+            fresh.append(e)
+    for metric, pts in by_metric.items():
+        if pts:
+            seen.discard((metric, ABSENT_KEY_TS))
     return fresh
 
 
