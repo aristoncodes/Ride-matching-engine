@@ -27,6 +27,6 @@ USER copilot
 
 EXPOSE 8000
 
-# NOTE: copilot.api.app does not exist yet (added in a later phase). Until then,
-# this CMD will fail at startup; the image build itself does not depend on it.
+# copilot.api.app refuses to import unless COPILOT_API_TOKEN is set; the token
+# comes from the copilot-env Secret in k8s/base/copilot.yaml, never from the image.
 CMD ["uvicorn", "copilot.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
