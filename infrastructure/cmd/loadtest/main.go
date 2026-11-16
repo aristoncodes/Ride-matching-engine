@@ -58,17 +58,26 @@ func main() {
 		riders     = flag.Int("riders", 2000, "ride requests to submit (pipeline mode)")
 		rate       = flag.Int("rate", 500, "ride requests per second (pipeline mode)")
 		pingEvery  = flag.Duration("ping-every", 3*time.Second, "driver ping interval")
-		out        = flag.String("out", "", "write a Markdown report to this path")
-		apiKey     = flag.String("key", os.Getenv("RIDEMATCH_API_KEY"),
+		regionFlag = flag.String("region", "centre",
+			"geographic profile: centre (0.09/0.18-degree box, default) | bengaluru (city-wide, demand-weighted riders)")
+		dialRate = flag.Int("dial-rate", 200, "driver dials started per second (pipeline mode)")
+		out      = flag.String("out", "", "write a Markdown report to this path")
+		apiKey   = flag.String("key", os.Getenv("RIDEMATCH_API_KEY"),
 			"API key (or RIDEMATCH_API_KEY). Required unless the services run with --allow-anonymous")
 	)
 	flag.Parse()
 
+	reg, err := parseRegion(*regionFlag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+
 	switch *mode {
 	case "pipeline":
-		runPipeline(*wsURL, *restURL, *apiKey, *drivers, *riders, *rate, *pingEvery, *out)
+		runPipeline(*wsURL, *restURL, *apiKey, *drivers, *riders, *rate, *pingEvery, *out, reg, *dialRate)
 	case "sweep":
-		runSweep(*engineAddr, *out)
+		runSweep(*engineAddr, *out, reg)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown mode %q\n", *mode)
 		os.Exit(2)
@@ -161,15 +170,16 @@ func round(d time.Duration) time.Duration {
 // ---------------------------------------------------------------------------
 
 func runPipeline(wsURL, restURL, apiKey string, numDrivers, numRiders, rate int,
-	pingEvery time.Duration, outPath string) {
+	pingEvery time.Duration, outPath string, reg region, dialRate int) {
 
 	fmt.Printf("=== pipeline load test ===\n")
-	fmt.Printf("drivers=%d  riders=%d  rate=%d/s  ping=%v\n\n", numDrivers, numRiders, rate, pingEvery)
+	fmt.Printf("drivers=%d  riders=%d  rate=%d/s  ping=%v  region=%s\n\n", numDrivers, numRiders, rate, pingEvery, reg)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var connected, connectFailed, refused atomic.Int64
+	var connected, connectFailed, refused, dialRetries atomic.Int64
+	dialErrs := newErrBuckets(apiKey)
 	connectLatency := &recorder{}
 
 	// ---- Ramp drivers ----------------------------------------------------
@@ -182,19 +192,40 @@ func runPipeline(wsURL, restURL, apiKey string, numDrivers, numRiders, rate int,
 	// exhausts ephemeral ports.
 	dialSem := make(chan struct{}, 200)
 
+	if dialRate < 1 {
+		dialRate = 1
+	}
+	dialTick := time.NewTicker(time.Second / time.Duration(dialRate))
+	defer dialTick.Stop()
+	backoffs := []time.Duration{100 * time.Millisecond, 300 * time.Millisecond, 900 * time.Millisecond}
+
 	for i := 0; i < numDrivers; i++ {
+		<-dialTick.C // ramp: spread driver starts at dialRate per second
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			dialSem <- struct{}{}
 			start := time.Now()
-			conn, resp, err := websocket.DefaultDialer.Dial(wsURL, authHeader(apiKey))
-			<-dialSem
+			var conn *websocket.Conn
+			var resp *http.Response
+			var err error
+			for attempt := 0; ; attempt++ {
+				dialSem <- struct{}{}
+				conn, resp, err = websocket.DefaultDialer.Dial(wsURL, authHeader(apiKey))
+				<-dialSem
+				if err == nil || (resp != nil && resp.StatusCode == http.StatusServiceUnavailable) ||
+					attempt >= len(backoffs) {
+					break
+				}
+				dialErrs.add(err)
+				dialRetries.Add(1)
+				time.Sleep(backoffs[attempt])
+			}
 
 			if err != nil {
 				if resp != nil && resp.StatusCode == http.StatusServiceUnavailable {
 					refused.Add(1) // the server correctly enforcing its limit
 				} else {
+					dialErrs.add(err)
 					connectFailed.Add(1)
 				}
 				return
@@ -215,8 +246,7 @@ func runPipeline(wsURL, restURL, apiKey string, numDrivers, numRiders, rate int,
 			}()
 
 			rng := rand.New(rand.NewSource(int64(id)*7919 + 3))
-			lat := 12.9716 + (rng.Float64()-0.5)*0.09
-			lng := 77.5946 + (rng.Float64()-0.5)*0.09
+			lat, lng := reg.uniformPoint(rng, 0.09)
 
 			// Stagger, or every driver fires on the same millisecond and the
 			// load arrives as a spike per interval rather than as a stream.
@@ -262,6 +292,8 @@ func runPipeline(wsURL, restURL, apiKey string, numDrivers, numRiders, rate int,
 
 	fmt.Printf("  connected=%d failed=%d refused=%d in %v\n",
 		connected.Load(), connectFailed.Load(), refused.Load(), rampDuration.Round(time.Millisecond))
+	dialErrs.print(5)
+	fmt.Printf("  dial retries=%d\n", dialRetries.Load())
 	fmt.Printf("  connect latency: %s\n\n", connectLatency.stats())
 
 	// Let a couple of ping cycles land so the driver pool is populated before
@@ -295,8 +327,7 @@ func runPipeline(wsURL, restURL, apiKey string, numDrivers, numRiders, rate int,
 	rng := rand.New(rand.NewSource(42))
 	for i := 0; i < numRiders; i++ {
 		<-limiter.C
-		lat := 12.9716 + (rng.Float64()-0.5)*0.09
-		lng := 77.5946 + (rng.Float64()-0.5)*0.09
+		lat, lng := reg.riderPoint(rng, 0.09)
 
 		submitWG.Add(1)
 		go func(i int, lat, lng float64) {
@@ -348,12 +379,31 @@ func runPipeline(wsURL, restURL, apiKey string, numDrivers, numRiders, rate int,
 
 	cancel()
 
+	if reason := pipelineFailure(connected.Load(), accepted.Load()); reason != "" {
+		defer func() {
+			fmt.Fprintln(os.Stderr, reason)
+			os.Exit(2)
+		}()
+	}
+
 	if outPath != "" {
 		writePipelineReport(outPath, numDrivers, numRiders, rate,
 			connected.Load(), refused.Load(), connectLatency.stats(), reqStats,
-			rampDuration, submitDuration)
+			rampDuration, submitDuration, reg)
 		fmt.Printf("report written to %s\n", outPath)
 	}
+}
+
+// pipelineFailure returns a one-line reason when a pipeline run achieved nothing
+// (no driver connected, or no ride request accepted), else "". main exits 2 on it.
+func pipelineFailure(connected, accepted int64) string {
+	switch {
+	case connected == 0:
+		return "loadtest: no drivers connected; check -ws, -key and that ingestd is reachable"
+	case accepted == 0:
+		return "loadtest: no ride requests accepted; check -rest and -key"
+	}
+	return ""
 }
 
 // ---------------------------------------------------------------------------
@@ -375,8 +425,8 @@ func authHeader(apiKey string) http.Header {
 	return http.Header{"X-API-Key": []string{apiKey}}
 }
 
-func runSweep(engineAddr string, outPath string) {
-	fmt.Printf("=== complexity sweep (direct gRPC to the engine) ===\n\n")
+func runSweep(engineAddr string, outPath string, reg region) {
+	fmt.Printf("=== complexity sweep (direct gRPC to the engine) ===\nregion=%s\n\n", reg)
 
 	client, err := engine.Dial(engineAddr, engine.WithTimeout(120*time.Second))
 	if err != nil {
@@ -401,7 +451,7 @@ func runSweep(engineAddr string, outPath string) {
 	// --- Vary N with M fixed. Prediction: roughly linear. ---
 	fmt.Println("A. riders (N) varying, drivers (M) fixed at 2000, k=8")
 	for _, n := range []int{100, 200, 400, 800, 1600, 3200} {
-		p := measure(ctx, client, n, 2000, k, repeats)
+		p := measure(ctx, client, n, 2000, k, repeats, reg)
 		p.Series = "N"
 		points = append(points, p)
 		fmt.Printf("   N=%-5d M=2000  %s\n", n, p.Solve)
@@ -410,7 +460,7 @@ func runSweep(engineAddr string, outPath string) {
 	// --- Vary M with N fixed. Prediction: barely moves (the log term). ---
 	fmt.Println("\nB. drivers (M) varying, riders (N) fixed at 500, k=8")
 	for _, m := range []int{500, 1000, 2000, 4000, 8000, 16000} {
-		p := measure(ctx, client, 500, m, k, repeats)
+		p := measure(ctx, client, 500, m, k, repeats, reg)
 		p.Series = "M"
 		points = append(points, p)
 		fmt.Printf("   N=500  M=%-6d %s\n", m, p.Solve)
@@ -420,7 +470,7 @@ func runSweep(engineAddr string, outPath string) {
 	fmt.Println("\nC. control — DENSE matrix (k=0, every pair), which is O(N*M)")
 	var densePoints []sweepPoint
 	for _, n := range []int{100, 200, 400, 800} {
-		p := measure(ctx, client, n, n, 0, 3)
+		p := measure(ctx, client, n, n, 0, 3, reg)
 		p.Series = "dense"
 		densePoints = append(densePoints, p)
 		fmt.Printf("   N=M=%-5d dense  %s\n", n, p.Solve)
@@ -430,13 +480,13 @@ func runSweep(engineAddr string, outPath string) {
 	analyse(points, densePoints)
 
 	if outPath != "" {
-		writeSweepReport(outPath, points, densePoints)
+		writeSweepReport(outPath, points, densePoints, reg)
 		fmt.Printf("\nreport written to %s\n", outPath)
 	}
 }
 
-func measure(ctx context.Context, client *engine.Client, n, m, k, repeats int) sweepPoint {
-	req := buildBatch(n, m, k)
+func measure(ctx context.Context, client *engine.Client, n, m, k, repeats int, reg region) sweepPoint {
+	req := buildBatchRegion(n, m, k, reg)
 	rec := &recorder{}
 
 	// One untimed warm-up: the first call after a change in batch shape has a
@@ -472,6 +522,12 @@ func measure(ctx context.Context, client *engine.Client, n, m, k, repeats int) s
 }
 
 func buildBatch(n, m, k int) *matchingv1.MatchBatchRequest {
+	return buildBatchRegion(n, m, k, regionCentre)
+}
+
+// buildBatchRegion is deterministic per (n, m, region). Riders are drawn first,
+// then drivers, from one seeded stream. Centre output matches the original.
+func buildBatchRegion(n, m, k int, reg region) *matchingv1.MatchBatchRequest {
 	rng := rand.New(rand.NewSource(int64(n)*1000003 + int64(m)))
 	req := &matchingv1.MatchBatchRequest{
 		TenantId:              "loadtest",
@@ -479,23 +535,19 @@ func buildBatch(n, m, k int) *matchingv1.MatchBatchRequest {
 		CostMetric:            matchingv1.CostMetric_COST_METRIC_EUCLIDEAN,
 		MaxCandidatesPerRider: int32(k),
 	}
-	// A 20 km box, roughly a metropolitan service area.
+	// Centre: a 20 km box. Bengaluru: city box, riders demand-weighted.
 	for i := 0; i < n; i++ {
+		lat, lng := reg.riderPoint(rng, 0.18)
 		req.Riders = append(req.Riders, &matchingv1.Rider{
-			Id: fmt.Sprintf("R-%06d", i),
-			Pickup: &matchingv1.LatLng{
-				Lat: 12.9716 + (rng.Float64()-0.5)*0.18,
-				Lng: 77.5946 + (rng.Float64()-0.5)*0.18,
-			},
+			Id:     fmt.Sprintf("R-%06d", i),
+			Pickup: &matchingv1.LatLng{Lat: lat, Lng: lng},
 		})
 	}
 	for j := 0; j < m; j++ {
+		lat, lng := reg.uniformPoint(rng, 0.18)
 		req.CandidateDrivers = append(req.CandidateDrivers, &matchingv1.Driver{
-			Id: fmt.Sprintf("D-%06d", j),
-			Location: &matchingv1.LatLng{
-				Lat: 12.9716 + (rng.Float64()-0.5)*0.18,
-				Lng: 77.5946 + (rng.Float64()-0.5)*0.18,
-			},
+			Id:       fmt.Sprintf("D-%06d", j),
+			Location: &matchingv1.LatLng{Lat: lat, Lng: lng},
 		})
 	}
 	return req

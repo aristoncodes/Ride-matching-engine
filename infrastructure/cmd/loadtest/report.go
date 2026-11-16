@@ -35,13 +35,14 @@ func row(s stats) string {
 
 func writePipelineReport(path string, drivers, riders, rate int,
 	connected, refused int64, connectStats, reqStats stats,
-	ramp, submit time.Duration) {
+	ramp, submit time.Duration, reg region) {
 
 	var b strings.Builder
 	b.WriteString(header("Load Test — End-to-End Pipeline"))
 
 	fmt.Fprintf(&b, "## Configuration\n\n")
 	fmt.Fprintf(&b, "| | |\n|---|---|\n")
+	fmt.Fprintf(&b, "| Region | %s |\n", reg)
 	fmt.Fprintf(&b, "| Concurrent drivers | %d |\n", drivers)
 	fmt.Fprintf(&b, "| Ride requests | %d |\n", riders)
 	fmt.Fprintf(&b, "| Target submit rate | %d/s |\n", rate)
@@ -74,9 +75,10 @@ func writePipelineReport(path string, drivers, riders, rate int,
 	}
 }
 
-func writeSweepReport(path string, sparse, dense []sweepPoint) {
+func writeSweepReport(path string, sparse, dense []sweepPoint, reg region) {
 	var b strings.Builder
 	b.WriteString(header("Load Test — Complexity Sweep"))
+	fmt.Fprintf(&b, "**Region:** `%s`\n\n", reg)
 
 	fmt.Fprintf(&b, "## The claim under test\n\n")
 	fmt.Fprintf(&b, "The TDD claims matching is near **O(N log M)** rather than **O(N·M)**, where "+

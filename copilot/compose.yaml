@@ -1,0 +1,26 @@
+# LOCAL DEVELOPMENT ONLY. The defaults below (e.g. the fallback database password)
+# exist so `docker compose up` works on a laptop. Do not use them anywhere else,
+# and never put real credentials in this file; set COPILOT_DB_PASSWORD in your shell
+# or a local .env file instead.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: copilot
+      POSTGRES_DB: copilot
+      POSTGRES_PASSWORD: ${COPILOT_DB_PASSWORD:-copilot-local-only}
+      # Role passwords for initdb/01-roles.sql. The ":-local-only" defaults are for local
+      # development only; set real values in your shell or .env anywhere else.
+      COPILOT_APP_PASSWORD: ${COPILOT_APP_PASSWORD:-local-dev-only}
+      COPILOT_RO_PASSWORD: ${COPILOT_RO_PASSWORD:-local-dev-only}
+      FAULT_INJECTOR_PASSWORD: ${FAULT_INJECTOR_PASSWORD:-local-dev-only}
+    volumes:
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    ports:
+      - "9090:9090"

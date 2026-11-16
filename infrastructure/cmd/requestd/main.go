@@ -28,14 +28,17 @@ import (
 	"github.com/aditya/ride-matching/internal/authsetup"
 	"github.com/aditya/ride-matching/internal/metrics"
 	"github.com/aditya/ride-matching/internal/queue"
+	"github.com/aditya/ride-matching/internal/results"
 )
 
 func main() {
 	var (
 		addr      = flag.String("addr", ":8081", "HTTP listen address")
 		redisAddr = flag.String("redis", "localhost:6379", "Redis address or unix socket path")
-		tenant    = flag.String("tenant", "default", "tenant id")
-		maxLen    = flag.Int64("stream-maxlen", 1_000_000, "max ride requests retained in the stream")
+		resultTTL = flag.Duration("result-ttl", 24*time.Hour,
+			"how long a ride request's outcome stays readable")
+		tenant = flag.String("tenant", "default", "tenant id")
+		maxLen = flag.Int64("stream-maxlen", 1_000_000, "max ride requests retained in the stream")
 	)
 	// Note the polarity: authentication is ON unless explicitly disabled. See
 	// internal/authsetup for why the flag is not --auth.
@@ -46,9 +49,13 @@ func main() {
 		"admin/pprof listen address (NEVER expose this publicly)")
 	contentionProfile := flag.Bool("contention-profile", false,
 		"enable block+mutex profiling; adds overhead, use only for a profiling run")
+	refreshEvery := flag.Duration("metrics-refresh-interval", metrics.DefaultRefreshInterval,
+		"how often to refresh the queue gauges without waiting for a scrape")
 	flag.Parse()
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// JSON lines, not text: the copilot's DP-1 loader parses these into Postgres,
+	// and text lines can't be split reliably once a message contains spaces or quotes.
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
 	// Profiling lives on its own port. See internal/adminserver: importing
@@ -106,9 +113,19 @@ func main() {
 	}
 	defer closeKeys()
 
+	// Backs GET /v1/ride-requests/{id}. Shares the Redis instance the queue
+	// already uses — this is a small, TTL'd keyspace, not a second datastore.
+	outcomes, err := results.NewRedis(*redisAddr, results.Options{TTL: *resultTTL})
+	if err != nil {
+		logger.Error("could not configure the results store", "err", err)
+		os.Exit(1)
+	}
+	defer outcomes.Close()
+
 	cfg := api.DefaultConfig()
 	cfg.TenantID = *tenant
 	cfg.Keys = keys
+	cfg.Results = outcomes
 	cfg.Logger = logger
 
 	srv, err := api.NewServer(q, cfg)
@@ -130,6 +147,8 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	go metrics.RefreshStreamGauges(ctx, q, *refreshEvery, logger)
 
 	go func() {
 		logger.Info("requestd listening", "addr", *addr, "tenant", *tenant)

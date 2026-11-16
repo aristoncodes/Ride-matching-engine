@@ -45,9 +45,12 @@ flowchart TB
     end
     redis[("Redis GEO")]
     queue[("Message Queue")]
+    outcomes[("Results Store\n(outcomes, 24h TTL)")]
 
     ws --> redis
     api --> queue
+    api --> outcomes
+    batcher --> outcomes
     batcher --> queue
     batcher --> bridge
     bridge -->|cost matrix request| qt
@@ -59,6 +62,12 @@ flowchart TB
 
 Legend: ✅ = implemented (Quadtree Week 2, MCMF matcher Week 3). Everything else is scheduled per the TDD.
 
+The results store is written by **both** the API (`PENDING` on accept) and the
+batcher (the terminal state), and read only by the API. It is the one piece of
+state that outlives a request's presence in the queue — by design, since the
+queue holds work and deletes it on completion, while an outcome is only useful
+*after* the work is done.
+
 ## 3. The Critical Path: a ride request end-to-end
 
 ```mermaid
@@ -69,10 +78,12 @@ sequenceDiagram
     participant B as Match Batcher (Go)
     participant C as C++ Engine
     participant R as Redis GEO
+    participant S as Results Store
 
     Rider->>API: POST /v1/ride-requests (tenant, pickup)
     API->>API: validate + authenticate (API key, tenant)
     API->>Q: enqueue RideRequest (durable)
+    API->>S: record PENDING
     API-->>Rider: 202 Accepted (request id)
 
     loop every 3 seconds
@@ -81,11 +92,29 @@ sequenceDiagram
         B->>C: gRPC: batch of riders + candidate drivers
         C->>C: build cost matrix (quadtree + router)
         C->>C: solve optimal assignment (Hungarian/MCMF)
-        C-->>B: rider→driver matches (+ cost/ETA)
+        C-->>B: rider→driver matches (+ ETA)
+        B->>S: record MATCHED / UNMATCHED
         B->>Q: ack processed requests
-        B-->>Rider: match result (rider id → driver id)
     end
+
+    Rider->>API: GET /v1/ride-requests/{id}
+    API->>S: read outcome (scoped to the authenticated tenant)
+    API-->>Rider: PENDING, or MATCHED with the driver
 ```
+
+Two things in that diagram are easy to skim past and are the whole design:
+
+**The batcher never talks to the rider.** An earlier version of this diagram
+drew `B-->>Rider: match result`, and that arrow was fiction — the batcher has
+no connection to the client and never did. The rider polls. There is no push
+channel in v1: no webhook, no rider socket. Anything drawn as a push here would
+be a diagram describing software that does not exist.
+
+**The write to the results store precedes the ack.** Ack-then-record loses the
+match outright on a crash, because the ack is what deletes the request. 
+Record-then-ack merely duplicates work: the request is redelivered, re-matched,
+and the record overwritten. That ordering is why at-least-once delivery is safe
+here rather than merely tolerable.
 
 ## 4. Failure & resiliency flow
 

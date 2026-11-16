@@ -393,7 +393,17 @@ curl -X POST $API/v1/ride-requests \
   -d '{"rider_id":"R-1","pickup":{"lat":12.9716,"lng":77.5946}}'
 # want: 202 and {"request_id":"req_...","status":"PENDING"}
 
-# 4. Nothing else is exposed
+# 4. Read the outcome back (poll a second or two after submitting)
+curl -s $API/v1/ride-requests/req_... -H "X-API-Key: $KEY"
+# PENDING until a window runs, then:
+# {"request_id":"req_...","status":"MATCHED",
+#  "match":{"driver_id":"D-42","straight_line_meters":812.5},"attempts":1}
+
+# 5. Another tenant's request is invisible, not merely forbidden
+curl -s -o /dev/null -w "%{http_code}\n" $API/v1/ride-requests/req_someoneelses \
+  -H "X-API-Key: $KEY"                                       # want 404, never 403
+
+# 6. Nothing else is exposed
 curl -s -o /dev/null -w "%{http_code}\n" $API/metrics        # want 404
 curl -s -o /dev/null -w "%{http_code}\n" $API/debug/pprof/   # want 404
 nc -zv api.yourdomain.com 6379                               # want: refused
@@ -435,6 +445,7 @@ source ~/.bashrc
 | Logs | `dc logs -f batcherd` |
 | Restart one service | `dc restart requestd` |
 | Deploy an update | `git pull && dc up -d --build` |
+| Check a ride's outcome | `curl -s $API/v1/ride-requests/req_... -H "X-API-Key: $KEY"` |
 | New key for a customer | `dc run --rm keyadmin create --tenant acme --name "acme prod"` |
 | List a tenant's keys | `dc run --rm keyadmin list --tenant acme` |
 | Rotate a key | `dc run --rm keyadmin rotate --key-id <id> --overlap 24h` |
@@ -453,6 +464,12 @@ dc run --rm keyadmin rotate --key-id <old-id> --overlap 24h
 
 Both keys work during the overlap. Move clients to the new one, then let the old
 one expire. Revoking instantly instead is how routine hygiene becomes an outage.
+
+`dc run --rm keyadmin list --tenant acme` shows the old key as **`rotating`**,
+not `revoked`, for as long as it still works — and the expiry column shows when
+the overlap lapses, to the minute. A key listed as `rotating` is a key clients
+are still allowed to use, so the migration is not finished until it reads
+`revoked`.
 
 ### Back up
 
@@ -486,6 +503,14 @@ how people get surprised in production.
 - **No staging environment.** You are testing in production.
 - **Riders cannot cancel and drivers cannot decline.** These were never built.
   For a demo that is fine; no real operator would accept it.
+- **Outcomes are polled, not pushed.** A rider reads
+  `GET /v1/ride-requests/{id}` until it leaves `PENDING`; there is no webhook
+  and no rider socket. Drivers are not notified of an assignment at all — the
+  match is recorded and readable, but turning it into an offer a driver can
+  accept or decline is the dispatch protocol, which is out of scope.
+- **Outcomes expire after 24 hours** (`--result-ttl`). This is a receipt to
+  poll for, not a trip history, and an unbounded keyspace in a Redis capped at
+  512 MB would eventually evict the API keys and the queue alongside it.
 
 For a portfolio demo, every one of these is an acceptable trade — and being able
 to say precisely which corners you cut, and why, is worth more in an interview

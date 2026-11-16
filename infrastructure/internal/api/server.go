@@ -30,6 +30,7 @@ import (
 	"github.com/aditya/ride-matching/internal/auth"
 	"github.com/aditya/ride-matching/internal/metrics"
 	"github.com/aditya/ride-matching/internal/queue"
+	"github.com/aditya/ride-matching/internal/results"
 )
 
 // Config tunes the server.
@@ -56,6 +57,17 @@ type Config struct {
 	// rather than a hung request holding a connection open.
 	PublishTimeout time.Duration
 
+	// Results backs GET /v1/ride-requests/{id}.
+	//
+	// Optional: nil serves 503 from that one route and leaves POST untouched,
+	// so a deployment without it still accepts and matches rides. That is the
+	// honest failure — the alternative, 404, would tell a client their request
+	// does not exist when in fact the server simply cannot look.
+	Results results.Store
+
+	// ResultsTimeout bounds the outcome lookup.
+	ResultsTimeout time.Duration
+
 	Logger *slog.Logger
 
 	// Now is injectable for tests.
@@ -68,6 +80,7 @@ func DefaultConfig() Config {
 		TenantID:       "default",
 		MaxBodyBytes:   16 * 1024,
 		PublishTimeout: 2 * time.Second,
+		ResultsTimeout: time.Second,
 		Logger:         slog.Default(),
 		Now:            time.Now,
 	}
@@ -83,6 +96,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.PublishTimeout <= 0 {
 		c.PublishTimeout = d.PublishTimeout
+	}
+	if c.ResultsTimeout <= 0 {
+		c.ResultsTimeout = d.ResultsTimeout
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
@@ -152,6 +168,30 @@ type rideRequestAccepted struct {
 	Status    string `json:"status"`
 }
 
+// matchBody is the assignment, present only on a MATCHED request.
+type matchBody struct {
+	DriverID string `json:"driver_id"`
+
+	// Pointer so ABSENT and ZERO stay distinguishable, matching the engine's
+	// `optional int32` on the wire. Under EUCLIDEAN pricing there is no ETA at
+	// all, and a literal 0 would read as "the car is already here".
+	ETASeconds         *int32  `json:"eta_seconds,omitempty"`
+	StraightLineMeters float64 `json:"straight_line_meters"`
+}
+
+type rideRequestStatus struct {
+	RequestID string     `json:"request_id"`
+	Status    string     `json:"status"`
+	Match     *matchBody `json:"match"`
+
+	// Reason explains a terminal non-match. Omitted when there is nothing to
+	// explain.
+	Reason string `json:"reason,omitempty"`
+
+	Attempts  int    `json:"attempts"`
+	UpdatedAt string `json:"updated_at,omitempty"`
+}
+
 // ---- Routing -----------------------------------------------------------
 
 // Routes returns the mounted handler, middleware included.
@@ -165,6 +205,7 @@ func (s *Server) Routes() http.Handler {
 	// yields 405 from the router rather than falling through to a handler that
 	// has to check the method itself.
 	mux.HandleFunc("POST /v1/ride-requests", s.handleCreateRideRequest)
+	mux.HandleFunc("GET /v1/ride-requests/{id}", s.handleGetRideRequest)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /readyz", s.handleReady)
 	mux.HandleFunc("GET /stats", s.handleStats)
@@ -392,6 +433,18 @@ func (s *Server) handleCreateRideRequest(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Record PENDING so the request is immediately readable.
+	//
+	// Written AFTER the publish, deliberately: if the publish fails there is no
+	// request, and a PENDING record for one would be a promise about work that
+	// was never queued. Best-effort, so a results-store blip degrades polling
+	// (404 until the batcher writes a terminal state) rather than rejecting a
+	// ride that is already durably queued.
+	//
+	// This is also what lets 404 mean something precise on the read path:
+	// "never accepted", as opposed to "accepted, still waiting".
+	s.recordPending(r.Context(), req)
+
 	// 202, not 201: nothing has been created yet. The request is queued and
 	// will be matched in a later window, and claiming otherwise would be a lie
 	// the client might act on.
@@ -477,6 +530,111 @@ func validate(in rideRequestInput) (field, message string) {
 	return "", ""
 }
 
+// recordPending marks a freshly accepted request as PENDING. Best effort; see
+// the call site.
+func (s *Server) recordPending(ctx context.Context, req queue.RideRequest) {
+	if s.cfg.Results == nil {
+		return
+	}
+
+	// Detached from the request context. Tying it to the client's connection
+	// would mean a client that hangs up the instant after a successful POST
+	// cancels the record of a ride that IS queued and WILL be matched.
+	writeCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx), s.cfg.ResultsTimeout)
+	defer cancel()
+
+	err := s.cfg.Results.Put(writeCtx, results.Outcome{
+		RequestID: req.RequestID,
+		TenantID:  req.TenantID,
+		Status:    results.StatusPending,
+		UpdatedAt: s.cfg.Now(),
+	})
+	if err != nil {
+		s.cfg.Logger.Error("could not record pending request",
+			"err", err, "request_id", req.RequestID)
+	}
+}
+
+// handleGetRideRequest returns a request's current status and its match.
+func (s *Server) handleGetRideRequest(w http.ResponseWriter, r *http.Request) {
+	requestID := RequestIDFrom(r.Context())
+	id := r.PathValue("id")
+
+	// Validated with the SAME function that sanitises inbound trace ids,
+	// because ids are minted by that generator and so share its alphabet. A
+	// mismatch means the id could not have been issued here, and rejecting it
+	// keeps client-controlled text out of the store's key space.
+	if id == "" || len(id) > 64 || sanitiseRequestID(id) != id {
+		s.rejected.Add(1)
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument,
+			"request id is not a valid identifier", "id", requestID)
+		return
+	}
+
+	if s.cfg.Results == nil {
+		// 503, not 404. The request may well exist; this instance simply has
+		// nowhere to look, and saying "no such request" would be a false
+		// statement about the client's data rather than a true one about us.
+		writeError(w, http.StatusServiceUnavailable, CodeUnavailable,
+			"request status lookup is not available on this deployment", "", requestID)
+		return
+	}
+
+	// The tenant comes from the AUTHENTICATED key, never from the request —
+	// the read path's half of the Week 19 isolation property. Because the
+	// tenant is part of the store's key, a client cannot read another tenant's
+	// request even knowing its id exactly.
+	tenantID := s.cfg.TenantID
+	if authenticated, ok := auth.TenantFromContext(r.Context()); ok {
+		tenantID = authenticated
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.ResultsTimeout)
+	defer cancel()
+
+	out, err := s.cfg.Results.Get(ctx, tenantID, id)
+	if errors.Is(err, results.ErrNotFound) {
+		// 404 rather than 403, and for another tenant's request this is the
+		// ONLY correct answer: a 403 would confirm the id is real, which is
+		// itself the leak. "Not yours" and "not a thing" must be
+		// indistinguishable from outside.
+		writeError(w, http.StatusNotFound, CodeNotFound,
+			"no such ride request", "", requestID)
+		return
+	}
+	if err != nil {
+		s.failed.Add(1)
+		s.cfg.Logger.Error("could not read request outcome",
+			"err", err, "ride_request_id", id, "request_id", requestID)
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, CodeUnavailable,
+			"could not read the request status right now; please retry", "", requestID)
+		return
+	}
+
+	body := rideRequestStatus{
+		RequestID: out.RequestID,
+		Status:    string(out.Status),
+		Reason:    out.Reason,
+		Attempts:  out.Attempts,
+	}
+	if !out.UpdatedAt.IsZero() {
+		body.UpdatedAt = out.UpdatedAt.UTC().Format(time.RFC3339)
+	}
+	// `match` stays explicitly null unless the status is MATCHED, so a client
+	// cannot read a half-populated object as an assignment.
+	if out.Status == results.StatusMatched {
+		body.Match = &matchBody{
+			DriverID:           out.DriverID,
+			ETASeconds:         out.ETASeconds,
+			StraightLineMeters: out.StraightLineMeters,
+		}
+	}
+
+	writeJSON(w, http.StatusOK, requestID, body)
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// Liveness: is this process running? Deliberately does NOT check Redis —
 	// a liveness probe that fails on a dependency outage gets the process
@@ -539,7 +697,12 @@ func routeLabel(r *http.Request) string {
 	switch r.URL.Path {
 	case "/v1/ride-requests", "/healthz", "/readyz", "/stats":
 		return r.Method + " " + r.URL.Path
-	default:
-		return r.Method + " other"
 	}
+	// The id route is labelled by its PATTERN, never its path. One series per
+	// request id is the cardinality bomb this function exists to prevent, and
+	// this is the first route where the path actually contains one.
+	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/ride-requests/") {
+		return "GET /v1/ride-requests/{id}"
+	}
+	return r.Method + " other"
 }

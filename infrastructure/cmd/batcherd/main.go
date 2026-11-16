@@ -31,11 +31,14 @@ import (
 	"github.com/aditya/ride-matching/internal/locations"
 	"github.com/aditya/ride-matching/internal/metrics"
 	"github.com/aditya/ride-matching/internal/queue"
+	"github.com/aditya/ride-matching/internal/results"
 )
 
 func main() {
 	var (
-		redisAddr   = flag.String("redis", "localhost:6379", "Redis address or unix socket path")
+		redisAddr = flag.String("redis", "localhost:6379", "Redis address or unix socket path")
+		resultTTL = flag.Duration("result-ttl", 24*time.Hour,
+			"how long a ride request's outcome stays readable")
 		engineAddr  = flag.String("engine", "localhost:50051", "C++ matching engine gRPC address")
 		metricsAddr = flag.String("metrics-addr", ":8082", "address for /healthz and /stats")
 		tenant      = flag.String("tenant", "default", "tenant id")
@@ -51,9 +54,13 @@ func main() {
 		"admin/pprof listen address (NEVER expose this publicly)")
 	contentionProfile := flag.Bool("contention-profile", false,
 		"enable block+mutex profiling; adds overhead, use only for a profiling run")
+	refreshEvery := flag.Duration("metrics-refresh-interval", metrics.DefaultRefreshInterval,
+		"how often to refresh the queue gauges without waiting for a scrape")
 	flag.Parse()
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// JSON lines, not text: the copilot's DP-1 loader parses these into Postgres,
+	// and text lines can't be split reliably once a message contains spaces or quotes.
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
 	// Profiling lives on its own port. See internal/adminserver: importing
@@ -102,6 +109,15 @@ func main() {
 		os.Exit(1)
 	}
 	defer q.Close()
+
+	// Where a solved batch's answers are written, so that acking a matched
+	// request no longer destroys the only record of the match.
+	outcomes, err := results.NewRedis(*redisAddr, results.Options{TTL: *resultTTL})
+	if err != nil {
+		logger.Error("could not configure the results store", "err", err)
+		os.Exit(1)
+	}
+	defer outcomes.Close()
 
 	locOpts := locations.DefaultOptions()
 	locOpts.TenantID = *tenant
@@ -209,6 +225,7 @@ func main() {
 	cfg.CostMetric = metric
 	cfg.RoadGraphID = *graphID
 	cfg.SolveTimeout = *window / 2
+	cfg.Results = outcomes
 	cfg.Logger = logger
 	cfg.TenantLabel = *tenant
 
@@ -220,6 +237,8 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	go metrics.RefreshStreamGauges(ctx, q, *refreshEvery, logger)
 
 	go func() {
 		if err := b.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {

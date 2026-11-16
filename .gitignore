@@ -32,6 +32,14 @@ benchmark_results.txt
 infrastructure/gen/
 matching_engine/gen/
 
+# NOT ignored, on purpose: matching_engine/data/bengaluru_roads.osm
+#
+# The one data blob that is committed. Every routing benchmark and the 1.51x
+# detour-factor measurement is quoted against THAT extract, so a reader who
+# re-downloads a fresh one from OpenStreetMap gets different numbers and no way
+# to tell whether the code or the map changed. Committing it is what makes the
+# claims reproducible.
+
 # Local compose env (may contain machine-specific config)
 .env
 

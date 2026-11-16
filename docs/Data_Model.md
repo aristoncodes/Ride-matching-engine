@@ -44,6 +44,43 @@ A concrete decision to avoid the collision we already hit (riders and drivers bo
 | `created_at` | timestamp | |
 
 ### Match (the result)
+
+> **As built** (`internal/results`, Redis key `results:<tenant>:<request_id>`).
+> The Week-1 draft below it is kept for the diff; three fields changed once the
+> engine existed.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `request_id` | string | the key, and the id the API returned to the client |
+| `tenant_id` | string | **part of the Redis key**, not a field to compare after reading — see below |
+| `status` | enum | `PENDING`, `MATCHED`, `UNMATCHED`, `FAILED` |
+| `driver_id` | string | set only when `MATCHED` |
+| `straight_line_meters` | double | always set on a match; makes the result auditable |
+| `eta_seconds` | int, optional | **absent** under euclidean pricing, never 0 |
+| `reason` | string | why a non-matched terminal state was reached |
+| `attempts` | int | how many match windows this request went through |
+| `updated_at` | timestamp | server clock at the last write |
+
+Three corrections against the Week-1 draft, each forced by the implementation:
+
+- **No `id`.** A `M-<uuid>` would be a second identifier for something the
+  client already addresses by `request_id`, and it could not be used for the
+  lookup the client actually performs.
+- **No `cost`.** It was an untyped `double` whose unit depended on the cost
+  metric, so a client could not interpret it without knowing which metric ran.
+  `matching.proto` reserves the field name for exactly this reason;
+  `straight_line_meters` replaces it with something dimensioned.
+- **`eta_seconds` is optional.** Under euclidean pricing the engine has no
+  basis for an ETA. A default 0 reads as "the car is already here".
+
+The tenant being in the KEY rather than a field is the isolation boundary: a
+cross-tenant read addresses a key that does not exist, so it cannot leak a
+driver id or even confirm the request is real. A tenant *field*, compared after
+reading, works until one handler forgets the comparison.
+
+<details>
+<summary>Week-1 draft, superseded</summary>
+
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | string | `M-<uuid>` |
@@ -53,6 +90,8 @@ A concrete decision to avoid the collision we already hit (riders and drivers bo
 | `cost` | double | distance or travel-time cost used by the solver |
 | `eta_seconds` | int | from the routing component |
 | `matched_at` | timestamp | |
+
+</details>
 
 ### Tenant
 | Field | Type | Notes |
@@ -72,11 +111,28 @@ These are *not* persisted; they exist only inside the engine per batch.
 
 ## 4. Lifecycle: RideRequest state machine
 
+**As built.** Only the states a client can actually observe:
+
 ```
-PENDING ──(batch window closes)──▶ BATCHED ──(solver runs)──┬──▶ MATCHED
-   │                                                         └──▶ UNMATCHED ──(re-queue next window OR reject per policy)
-   └──(rider cancels)──▶ CANCELLED
+PENDING ──(solver runs)──┬──▶ MATCHED     driver assigned; terminal
+                         ├──▶ UNMATCHED   no car after MaxMatchAttempts windows; terminal
+                         └──▶ FAILED      could not be processed at all; terminal
+   │
+   └──(no driver this window, attempts remain)──▶ republished, stays PENDING
 ```
+
+Two states from the Week-1 draft are gone, and both removals are deliberate:
+
+- **`BATCHED`** is real internally but lasts milliseconds and is never
+  persisted. Advertising a state no client can catch is noise in a contract.
+- **`CANCELLED`** was never built. Riders cannot cancel — see
+  [Scope_and_Production_Comparison.md](Scope_and_Production_Comparison.md).
+  Publishing an enum value the server can never send is a contract that lies.
+
+`FAILED` is new, and the distinction from `UNMATCHED` is the point: UNMATCHED
+means the system looked and there was no car, which is a legitimate answer to
+give a customer. FAILED means the request was never properly considered, which
+is an operational fault.
 
 Driver: `ONLINE ──(assigned)──▶ EN_ROUTE ──(trip ends)──▶ ONLINE`; any state `──(no ping past TTL)──▶ OFFLINE`.
 
@@ -85,11 +141,29 @@ Driver: `ONLINE ──(assigned)──▶ EN_ROUTE ──(trip ends)──▶ ON
 | Data | Store | Rationale |
 |------|-------|-----------|
 | Live driver locations | Redis (GEO) | fast spatial reads/writes, TTL for staleness |
+| Ride-request outcomes | Redis (HASH, 24h TTL) | a receipt the client polls for, not a trip history |
 | Pending ride requests | Message queue (Kafka/Redis Streams) | durability, redelivery on crash |
 | Tenant / API-key records | Relational DB | strong consistency, isolation |
 | Per-batch compute state | In-memory (C++) | ephemeral, never persisted |
 
 ## 6. Open questions
 
-- Do matches need long-term persistence (audit/billing), or are they fire-and-forget to the client? (affects whether Match needs a durable store)
+- ~~Do matches need long-term persistence (audit/billing), or are they
+  fire-and-forget to the client? (affects whether Match needs a durable
+  store)~~ — **Resolved: neither.**
+
+  "Fire-and-forget to the client" turned out to be incoherent, because there is
+  no channel to forget them *to*: the batcher acked the request, which deleted
+  the only record that the match had happened, and the rider had no way to ask.
+  The endpoint documented in `rest-openapi.yaml` was unimplementable for as
+  long as that was true.
+
+  The answer is a **third option the question did not offer**: short-lived
+  durable storage. A 24-hour TTL'd hash is long enough for a client to poll and
+  bounded enough not to grow without limit in a Redis capped at 512 MB — where
+  unbounded growth would evict the API keys and the ride queue alongside it.
+  Long-term persistence stays unbuilt because nothing reads it: there is no
+  billing or audit feature, and building storage for a consumer that does not
+  exist is speculative work.
+
 - Geohash precision for the tenant/geo-partitioned locking in Week 13.

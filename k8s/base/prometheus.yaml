@@ -1,0 +1,382 @@
+# =============================================================================
+# Prometheus + Alertmanager
+#
+# Scrapes the admin/metrics port of the three Go services and evaluates the
+# alert rules from docs/Observability.md. Alerts route to the copilot webhook.
+#
+# Scrape strategy: pod-level discovery with the admin port rewritten onto each
+# pod IP. The admin ports (6060/6061/6062) are deliberately NOT exposed through
+# any Service: the services' Services are NodePort, and pprof must never be
+# reachable from outside the cluster. Discovering pods directly lets us reach
+# the admin port without widening any Service.
+#
+# Note: the batcherd container's admin listener is --admin-addr (default :6062),
+# separate from its --metrics-addr (:8082, /healthz and /stats).
+# =============================================================================
+
+# ---- Prometheus -------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: ride-matching
+  labels: { app.kubernetes.io/name: prometheus, app.kubernetes.io/part-of: ride-matching }
+---
+# Read-only access to pods in this namespace, enough for kubernetes_sd role: pod.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: prometheus
+  namespace: ride-matching
+  labels: { app.kubernetes.io/name: prometheus, app.kubernetes.io/part-of: ride-matching }
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prometheus
+  namespace: ride-matching
+  labels: { app.kubernetes.io/name: prometheus, app.kubernetes.io/part-of: ride-matching }
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: ride-matching
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: ride-matching
+  labels: { app.kubernetes.io/name: prometheus, app.kubernetes.io/part-of: ride-matching }
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    rule_files:
+      - /etc/prometheus/alert-rules.yml
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets: ["alertmanager:9093"]
+
+    scrape_configs:
+      # Each job selects pods by app.kubernetes.io/name, keeps only the declared
+      # "http" container port (so each pod yields exactly one target), and then
+      # rewrites the address onto the admin port for that service.
+      - job_name: ingestd
+        metrics_path: /metrics
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces: { names: [ride-matching] }
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+            regex: ingestd
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_container_port_name]
+            regex: http
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_ip]
+            regex: (.+)
+            target_label: __address__
+            replacement: $1:6060
+
+      - job_name: requestd
+        metrics_path: /metrics
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces: { names: [ride-matching] }
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+            regex: requestd
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_container_port_name]
+            regex: http
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_ip]
+            regex: (.+)
+            target_label: __address__
+            replacement: $1:6061
+
+      - job_name: batcherd
+        metrics_path: /metrics
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces: { names: [ride-matching] }
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+            regex: batcherd
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_container_port_name]
+            regex: http
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_ip]
+            regex: (.+)
+            target_label: __address__
+            replacement: $1:6062
+
+      # The copilot's own metrics (ticket 3.2). /metrics needs no credentials.
+      - job_name: copilot
+        metrics_path: /metrics
+        static_configs:
+          - targets: ["copilot.ride-matching:8000"]
+
+  alert-rules.yml: |
+    # Alert rules from docs/Observability.md ("Alerting rules"), plus one Redis
+    # rule. runbook_anchor points at the matching section of docs/Runbook.md.
+    groups:
+      - name: ridematch
+        rules:
+          # Requests are being permanently discarded: "never lose a ride
+          # request" is failing, so this pages.
+          - alert: RequestsDeadLettered
+            expr: increase(ridematch_queue_dead_lettered[10m]) > 0
+            for: 0m
+            labels:
+              severity: critical
+              runbook_anchor: dropped-requests
+            annotations:
+              summary: "Ride requests are being dead-lettered"
+
+          # Matching is falling behind: arrivals outpace batchers.
+          - alert: QueueDepthHigh
+            expr: ridematch_queue_depth > 5000
+            for: 5m
+            labels:
+              severity: warning
+              runbook_anchor: queue-backlog
+            annotations:
+              summary: "Ride request queue depth is above 5000"
+
+          # Consumers claim work and do not finish it: crash loop or stuck reclaimer.
+          - alert: QueuePendingHigh
+            expr: ridematch_queue_pending > 1000
+            for: 5m
+            labels:
+              severity: warning
+              runbook_anchor: queue-backlog
+            annotations:
+              summary: "Claimed-but-unacked requests are above 1000"
+
+          # SLO: match latency p99.
+          - alert: MatchLatencyP99High
+            expr: |
+              histogram_quantile(0.99,
+                sum(rate(ridematch_match_latency_seconds_bucket[5m])) by (le, tenant)) > 5
+            for: 10m
+            labels:
+              severity: warning
+              runbook_anchor: high-latency
+            annotations:
+              summary: "Match latency p99 is above the 5s SLO"
+
+          # SLO: match rate. Fast but matching nobody is still a failure.
+          - alert: MatchRateLow
+            expr: |
+              sum(rate(ridematch_riders_total{outcome="matched"}[10m])) by (tenant)
+                / sum(rate(ridematch_riders_total[10m])) by (tenant) < 0.95
+            for: 10m
+            labels:
+              severity: warning
+              runbook_anchor: high-latency
+            annotations:
+              summary: "Match rate is below the 95% SLO"
+
+          # SLO: availability (non-5xx ratio).
+          - alert: Availability5xxHigh
+            expr: |
+              sum(rate(ridematch_http_requests_total{status_class="5xx"}[5m]))
+                / sum(rate(ridematch_http_requests_total[5m])) > 0.001
+            for: 5m
+            labels:
+              severity: critical
+              runbook_anchor: ingestion-down
+            annotations:
+              summary: "5xx ratio is above the 0.1% error budget threshold"
+
+          # Engine unreachable or timing out, sustained.
+          - alert: EngineRetryableErrors
+            expr: rate(ridematch_dependency_errors_total{dependency="engine",retryable="true"}[5m]) > 1
+            for: 5m
+            labels:
+              severity: warning
+              runbook_anchor: worker-crash-loop
+            annotations:
+              summary: "Sustained retryable errors calling the matching engine"
+
+          # Driver pool collapsed: ingestion stopped or TTL reaping everything.
+          - alert: DriversIndexedLow
+            expr: ridematch_drivers_indexed < 10 or absent(ridematch_drivers_indexed)
+            for: 5m
+            labels:
+              severity: critical
+              runbook_anchor: ingestion-down
+            annotations:
+              summary: "Fewer than 10 drivers in the live location index"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: ride-matching
+  labels: { app.kubernetes.io/name: prometheus, app.kubernetes.io/part-of: ride-matching }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: prometheus }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: prometheus, app.kubernetes.io/part-of: ride-matching }
+    spec:
+      serviceAccountName: prometheus
+      securityContext: { runAsNonRoot: true, runAsUser: 65534 }
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.54.1
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=24h
+            - --web.listen-address=:9090
+          ports: [{ name: http, containerPort: 9090 }]
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { cpu: "1",  memory: 1Gi }
+          readinessProbe:
+            httpGet: { path: /-/ready, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /-/healthy, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: config, mountPath: /etc/prometheus, readOnly: true }
+            - { name: data, mountPath: /prometheus }
+      volumes:
+        - name: config
+          configMap: { name: prometheus-config }
+        # Ephemeral TSDB. This is a local-cluster stack; a real one would use a
+        # PersistentVolumeClaim so history survives a pod restart.
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: ride-matching
+  labels: { app.kubernetes.io/name: prometheus, app.kubernetes.io/part-of: ride-matching }
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: prometheus }
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http
+---
+# ---- Alertmanager -----------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: ride-matching
+  labels: { app.kubernetes.io/name: alertmanager, app.kubernetes.io/part-of: ride-matching }
+data:
+  alertmanager.yml: |
+    route:
+      receiver: copilot
+      group_by: [alertname, tenant]
+      group_wait: 10s
+      group_interval: 5m
+      repeat_interval: 4h
+
+    receivers:
+      - name: copilot
+        webhook_configs:
+          - url: http://copilot.ride-matching:8000/alerts
+            send_resolved: true
+            http_config:
+              authorization:
+                type: Bearer
+                credentials_file: /etc/alertmanager/webhook-token/token
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  namespace: ride-matching
+  labels: { app.kubernetes.io/name: alertmanager, app.kubernetes.io/part-of: ride-matching }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: alertmanager }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: alertmanager, app.kubernetes.io/part-of: ride-matching }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 65534 }
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:v0.27.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yml
+            - --storage.path=/alertmanager
+            - --web.listen-address=:9093
+          ports: [{ name: http, containerPort: 9093 }]
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 500m, memory: 256Mi }
+          readinessProbe:
+            httpGet: { path: /-/ready, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /-/healthy, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: config, mountPath: /etc/alertmanager, readOnly: true }
+            - { name: webhook-token, mountPath: /etc/alertmanager/webhook-token, readOnly: true }
+            - { name: data, mountPath: /alertmanager }
+      volumes:
+        - name: config
+          configMap: { name: alertmanager-config }
+        # Secret copilot-webhook (key: token) is created outside git, e.g.
+        #   kubectl -n ride-matching create secret generic copilot-webhook --from-literal=token=...
+        # Its value must equal COPILOT_WEBHOOK_TOKEN on the copilot Deployment.
+        - name: webhook-token
+          secret: { secretName: copilot-webhook }
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: ride-matching
+  labels: { app.kubernetes.io/name: alertmanager, app.kubernetes.io/part-of: ride-matching }
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: alertmanager }
+  ports:
+    - name: http
+      port: 9093
+      targetPort: http

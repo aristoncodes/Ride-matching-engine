@@ -9,6 +9,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/aditya/ride-matching/internal/metrics"
 	"github.com/aditya/ride-matching/internal/redisconn"
 )
 
@@ -497,6 +498,12 @@ func (r *RedisRepository) Count(ctx context.Context) (int, error) {
 		n, innerErr = r.client.ZCard(ctx, r.geoKey()).Result()
 		return innerErr
 	})
+	if err == nil {
+		// Set here because this is the one place the index size is read; the
+		// ingest /stats handler is its caller, so the gauge is as fresh as
+		// that is polled.
+		metrics.DriversIndexed.WithLabelValues(r.opts.TenantID).Set(float64(n))
+	}
 	return int(n), err
 }
 

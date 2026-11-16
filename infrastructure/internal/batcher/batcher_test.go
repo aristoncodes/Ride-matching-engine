@@ -2,6 +2,7 @@ package batcher_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"github.com/aditya/ride-matching/internal/engine"
 	"github.com/aditya/ride-matching/internal/locations"
 	"github.com/aditya/ride-matching/internal/queue"
+	"github.com/aditya/ride-matching/internal/results"
 	"github.com/aditya/ride-matching/internal/testutil"
 )
 
@@ -448,3 +450,178 @@ func TestConfigValidation(t *testing.T) {
 		}
 	})
 }
+
+// ---- Outcome recording -------------------------------------------------
+
+// The gap this closes: the batcher used to compute an optimal assignment and
+// then destroy it by acking, leaving the rider with no way to learn which
+// driver they got. Matching without recording the match is not a finished
+// feature, it is a computation.
+func TestMatchedRequestsRecordTheirDriver(t *testing.T) {
+	cfg := batcher.DefaultConfig()
+	cfg.Window = 400 * time.Millisecond
+	cfg.SolveTimeout = 300 * time.Millisecond
+
+	store := results.NewMemory()
+	cfg.Results = store
+
+	// 2 riders, 3 drivers: both riders must match.
+	h := newHarness(t, &cfg)
+	h.seedDrivers(t, 3)
+	h.publishRiders(t, 2)
+
+	b, _ := batcher.New(h.queue, h.drivers, h.engine, cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = b.Run(ctx) }()
+
+	m := h.awaitBatch(t, 10*time.Second)
+	if m.Matched != 2 {
+		t.Fatalf("matched = %d, want 2", m.Matched)
+	}
+
+	assigned := map[string]bool{}
+	for _, id := range []string{"req-000", "req-001"} {
+		out, err := store.Get(context.Background(), "test", id)
+		if err != nil {
+			t.Fatalf("no outcome recorded for %s: %v", id, err)
+		}
+		if out.Status != results.StatusMatched {
+			t.Errorf("%s: status = %q, want MATCHED", id, out.Status)
+		}
+		if out.DriverID == "" {
+			t.Errorf("%s: recorded MATCHED with no driver — the answer is missing", id)
+		}
+		if out.StraightLineMeters <= 0 {
+			t.Errorf("%s: straight_line_meters = %v, want > 0",
+				id, out.StraightLineMeters)
+		}
+		if assigned[out.DriverID] {
+			t.Errorf("%s: driver %s was assigned to two riders", id, out.DriverID)
+		}
+		assigned[out.DriverID] = true
+	}
+}
+
+// A rider who runs out of match attempts must be TOLD. Dead-lettering alone
+// puts the answer in a stream only an operator reads, while the client goes on
+// polling PENDING for a request the system has already abandoned.
+func TestExhaustedRequestsAreRecordedAsUnmatched(t *testing.T) {
+	cfg := batcher.DefaultConfig()
+	cfg.Window = 300 * time.Millisecond
+	cfg.SolveTimeout = 200 * time.Millisecond
+	// One attempt and the rider is out of options, so the test does not have
+	// to sit through twenty windows to reach the branch.
+	cfg.MaxMatchAttempts = 1
+
+	store := results.NewMemory()
+	cfg.Results = store
+
+	// 2 riders, 1 driver: one rider cannot be matched at all.
+	h := newHarness(t, &cfg)
+	h.seedDrivers(t, 1)
+	h.publishRiders(t, 2)
+
+	b, _ := batcher.New(h.queue, h.drivers, h.engine, cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = b.Run(ctx) }()
+
+	m := h.awaitBatch(t, 10*time.Second)
+	if m.Exhausted != 1 {
+		t.Fatalf("exhausted = %d, want 1", m.Exhausted)
+	}
+
+	// Exactly one of the two is MATCHED and the other UNMATCHED; which one is
+	// the solver's business, not this test's.
+	var matched, unmatched int
+	for _, id := range []string{"req-000", "req-001"} {
+		out, err := store.Get(context.Background(), "test", id)
+		if err != nil {
+			t.Fatalf("no outcome recorded for %s: %v", id, err)
+		}
+		switch out.Status {
+		case results.StatusMatched:
+			matched++
+		case results.StatusUnmatched:
+			unmatched++
+			if out.Reason == "" {
+				t.Errorf("%s: UNMATCHED with no reason — the rider is told "+
+					"nothing about why", id)
+			}
+			if out.DriverID != "" {
+				t.Errorf("%s: UNMATCHED but carries driver %q", id, out.DriverID)
+			}
+		default:
+			t.Errorf("%s: unexpected status %q", id, out.Status)
+		}
+	}
+	if matched != 1 || unmatched != 1 {
+		t.Errorf("matched=%d unmatched=%d, want 1 and 1", matched, unmatched)
+	}
+}
+
+// A nil store must be a no-op rather than a panic: the k8s chaos test and the
+// older fake-stack tests run without one.
+func TestNilResultsStoreIsAllowed(t *testing.T) {
+	cfg := batcher.DefaultConfig()
+	cfg.Window = 400 * time.Millisecond
+	cfg.SolveTimeout = 300 * time.Millisecond
+	cfg.Results = nil
+
+	h := newHarness(t, &cfg)
+	h.seedDrivers(t, 2)
+	h.publishRiders(t, 2)
+
+	b, _ := batcher.New(h.queue, h.drivers, h.engine, cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = b.Run(ctx) }()
+
+	if m := h.awaitBatch(t, 10*time.Second); m.Matched != 2 {
+		t.Fatalf("matched = %d, want 2", m.Matched)
+	}
+}
+
+// Recording must not be able to fail a match. The assignment is already
+// computed and the ack decision already correct; turning a store blip into a
+// requeue would re-solve work that was fine and cost the rider another window.
+func TestResultsStoreOutageDoesNotBlockMatching(t *testing.T) {
+	cfg := batcher.DefaultConfig()
+	cfg.Window = 400 * time.Millisecond
+	cfg.SolveTimeout = 300 * time.Millisecond
+	cfg.Results = brokenResults{}
+
+	h := newHarness(t, &cfg)
+	h.seedDrivers(t, 2)
+	h.publishRiders(t, 2)
+
+	b, _ := batcher.New(h.queue, h.drivers, h.engine, cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = b.Run(ctx) }()
+
+	m := h.awaitBatch(t, 10*time.Second)
+	if m.Matched != 2 {
+		t.Fatalf("matched = %d, want 2 despite the results store failing", m.Matched)
+	}
+
+	// And they were still acked: the work genuinely completed.
+	time.Sleep(300 * time.Millisecond)
+	pending, err := h.queue.Pending(context.Background())
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	if pending != 0 {
+		t.Errorf("pending = %d, want 0 — a results outage must not requeue "+
+			"requests that were matched", pending)
+	}
+}
+
+type brokenResults struct{}
+
+func (brokenResults) Put(context.Context, results.Outcome) error { return errors.New("redis is down") }
+func (brokenResults) Get(context.Context, string, string) (results.Outcome, error) {
+	return results.Outcome{}, errors.New("redis is down")
+}
+func (brokenResults) Close() error { return nil }

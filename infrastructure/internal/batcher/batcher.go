@@ -28,6 +28,7 @@ import (
 	"github.com/aditya/ride-matching/internal/locations"
 	"github.com/aditya/ride-matching/internal/metrics"
 	"github.com/aditya/ride-matching/internal/queue"
+	"github.com/aditya/ride-matching/internal/results"
 )
 
 // Config tunes the batcher.
@@ -77,6 +78,19 @@ type Config struct {
 	// whereas "the consumer crashed five times" is an operational fault they
 	// should never see. Conflating them dead-letters real riders as poison.
 	MaxMatchAttempts int
+
+	// Results records each request's terminal outcome so the rider can read
+	// it back from GET /v1/ride-requests/{id}.
+	//
+	// Optional: nil disables recording, which keeps the Week 12-17 fake-stack
+	// tests and the k8s chaos test running unchanged. It is wired in
+	// cmd/batcherd, so a real deployment always has it.
+	//
+	// Without this the batcher computes an optimal assignment and then throws
+	// it away on ack — the queue holds WORK, and a completed request is
+	// deleted from it by definition. The answer has to be written somewhere
+	// that outlives the work.
+	Results results.Store
 
 	Logger *slog.Logger
 
@@ -384,7 +398,7 @@ func (b *Batcher) processBatch(ctx context.Context, msgs []queue.Message, reason
 		}
 	}
 
-	results, err := b.drivers.NearbyMany(ctx, queries)
+	nearby, err := b.drivers.NearbyMany(ctx, queries)
 	if err != nil {
 		// The driver store is down. Every request here is still valid, so
 		// requeue the whole batch rather than failing riders for an outage
@@ -399,7 +413,7 @@ func (b *Batcher) processBatch(ctx context.Context, msgs []queue.Message, reason
 	}
 
 	driverSet := map[string]locations.DriverLocation{}
-	for _, near := range results {
+	for _, near := range nearby {
 		for _, d := range near {
 			driverSet[d.DriverID] = d
 		}
@@ -465,6 +479,15 @@ func (b *Batcher) processBatch(ctx context.Context, msgs []queue.Message, reason
 			b.cfg.Logger.Error("solve failed permanently; dead-lettering batch",
 				"batch_id", batchID, "err", err)
 			for _, m := range msgs {
+				// FAILED, not UNMATCHED: the difference matters to whoever
+				// reads it. UNMATCHED means the system looked and there was
+				// no car — a legitimate answer. FAILED means the request was
+				// never properly considered, which is an operational fault
+				// and something a client may retry.
+				b.recordOutcome(ctx, m, results.Outcome{
+					Status: results.StatusFailed,
+					Reason: "the request could not be processed",
+				})
 				if dlErr := b.queue.DeadLetter(ctx, m, err.Error()); dlErr != nil {
 					b.cfg.Logger.Error("dead-letter failed", "err", dlErr)
 				}
@@ -477,15 +500,35 @@ func (b *Batcher) processBatch(ctx context.Context, msgs []queue.Message, reason
 	}
 
 	// ---- Settle ------------------------------------------------------------
-	matchedRequests := make(map[string]bool, len(resp.GetMatches()))
+	// The whole Match is kept, not just a bool. The driver id and the
+	// straight-line distance are the ANSWER the rider is waiting for, and this
+	// is the last point at which they exist — the ack below is what deletes
+	// the request, and everything not recorded before then is gone.
+	//
+	// Rider.Id is the RequestID (see the Solve block above), so this keys on
+	// the same id the API handed the client.
+	matchedRequests := make(map[string]*matchingv1.Match, len(resp.GetMatches()))
 	for _, m := range resp.GetMatches() {
-		matchedRequests[m.GetRiderId()] = true
+		matchedRequests[m.GetRiderId()] = m
 	}
 
 	var ackIDs []string
 	var requeue, exhausted int
 	for _, m := range msgs {
-		if matchedRequests[m.Request.RequestID] {
+		if match := matchedRequests[m.Request.RequestID]; match != nil {
+			// Record BEFORE acking, and the order is the point. Acking first
+			// and crashing loses the match with no trace of it anywhere:
+			// the queue entry is gone and nothing was written. Recording
+			// first and crashing merely redelivers the request, which is
+			// re-matched and overwrites this record — at-least-once doing
+			// exactly what it is for.
+			b.recordOutcome(ctx, m, results.Outcome{
+				Status:             results.StatusMatched,
+				DriverID:           match.GetDriverId(),
+				ETASeconds:         match.EtaSeconds,
+				StraightLineMeters: match.GetStraightLineMeters(),
+			})
+
 			// Matched: the work is done, so the request can finally be acked.
 			ackIDs = append(ackIDs, m.ID)
 			continue
@@ -508,8 +551,19 @@ func (b *Batcher) processBatch(ctx context.Context, msgs []queue.Message, reason
 			// Genuinely out of options. This IS a real answer for the rider —
 			// "no cars available" — so it is surfaced deliberately rather than
 			// retried forever.
-			if err := b.queue.DeadLetter(ctx, m, fmt.Sprintf(
-				"no driver found after %d match attempts", m.Request.MatchAttempts+1)); err != nil {
+			reason := fmt.Sprintf("no driver found after %d match attempts",
+				m.Request.MatchAttempts+1)
+
+			// Recorded so the rider is actually TOLD. A dead-letter stream is
+			// an operator's tool; without this write, "we looked and there is
+			// no car" reaches nobody but a log, and the client polls PENDING
+			// forever for a request the system has already given up on.
+			b.recordOutcome(ctx, m, results.Outcome{
+				Status: results.StatusUnmatched,
+				Reason: reason,
+			})
+
+			if err := b.queue.DeadLetter(ctx, m, reason); err != nil {
 				b.cfg.Logger.Error("could not dead-letter an exhausted request",
 					"request_id", m.Request.RequestID, "err", err)
 				continue
@@ -548,6 +602,39 @@ func (b *Batcher) processBatch(ctx context.Context, msgs []queue.Message, reason
 	b.exhausted.Add(int64(exhausted))
 
 	b.emit(metrics, started)
+}
+
+// recordOutcome writes a request's terminal state to the results store.
+//
+// BEST EFFORT, deliberately. A failed write here must not change what happens
+// to the request itself: the match is already computed and the ack decision is
+// already correct, and turning a results-store blip into a requeue would
+// re-solve work that was fine and charge a rider a second window for it. The
+// failure is logged and the client sees PENDING until the record's TTL — a
+// degraded answer, not a lost ride.
+//
+// A nil store disables recording entirely, which is what the fake-stack tests
+// and the chaos test run with.
+func (b *Batcher) recordOutcome(ctx context.Context, m queue.Message, out results.Outcome) {
+	if b.cfg.Results == nil {
+		return
+	}
+
+	out.RequestID = m.Request.RequestID
+	out.TenantID = m.Request.TenantID
+	out.Attempts = m.Request.MatchAttempts + 1
+	out.UpdatedAt = b.cfg.Now()
+
+	// Its own short timeout, detached from the batch context. Using ctx
+	// directly would mean a shutdown cancels the write of a match that already
+	// happened — the one moment the record matters most.
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+
+	if err := b.cfg.Results.Put(writeCtx, out); err != nil {
+		b.cfg.Logger.Error("could not record request outcome",
+			"request_id", out.RequestID, "status", out.Status, "err", err)
+	}
 }
 
 func (b *Batcher) emit(m BatchMetrics, started time.Time) {

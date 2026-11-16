@@ -58,6 +58,13 @@ Step-by-step responses to the failures we expect. Written before on-call, not du
 3. Preserve logs for the COE; notify security owner.
 4. This is always a COE and may be client-reportable.
 
+## <a id="redis-stall"></a>Redis stall (Sev-1)
+**Symptom:** `ridematch_dependency_errors_total{dependency="redis"}` rising, or requests stop reaching the stream while the Go services stay up.
+1. Check `redis-0`: is it paused, out of memory, or restarting? (`kubectl -n ride-matching get pod redis-0`, then `redis-cli INFO memory` and `redis-cli LATENCY DOCTOR`.)
+2. Check whether the stream `requests:stream:default` is still growing. A stall is an outage for every service that writes or reads it.
+3. Mitigate: restart `redis-0` only if it is wedged. Restarting loses in-memory state, so confirm the stream has persistence enabled first. Otherwise wait for the pause to end.
+4. After recovery, confirm the consumer group `batchers` is still attached and that the dead-letter count did not move.
+
 ---
 
 ## Escalation

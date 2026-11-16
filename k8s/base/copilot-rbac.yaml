@@ -1,0 +1,69 @@
+# Permissions for the incident copilot's remediation actions.
+#
+# The copilot can only act after a human approves (PRD: Safety), and even then
+# it gets the smallest set of verbs that makes the two actions it offers work.
+# Everything is a Role in ride-matching, never a ClusterRole, so a leaked token
+# cannot touch another namespace or any cluster-scoped object.
+#
+#   pods get, list        - a restart starts from "which pods belong to this
+#                           deployment?"; it cannot be answered without reading
+#                           them.
+#   pods delete           - restart = delete the pods and let the Deployment
+#                           controller recreate them. No `patch` on
+#                           deployments is needed for that.
+#                           RESIDUAL RISK: pod delete is namespace-wide. Pod names
+#                           change, so it cannot be narrowed with resourceNames.
+#                           The allowlist in copilot/actions/k8s.py is the only
+#                           thing limiting which pods the copilot deletes.
+#   deployments get       - (matching-engine and batcherd only, via resourceNames)
+#                           read the current replica count so the action can
+#                           check its bounds and record the "before" value.
+#   deployments/scale     - get reads the current scale, patch sets the new one.
+#                           Using the scale subresource means the copilot cannot
+#                           edit images, env or anything else on a Deployment.
+#
+# Nothing here reads Secrets, ConfigMaps or logs; evidence comes from
+# Prometheus and the database, not from the Kubernetes API.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: copilot
+  namespace: ride-matching
+  labels: { app.kubernetes.io/name: copilot, app.kubernetes.io/part-of: ride-matching }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: copilot-actions
+  namespace: ride-matching
+  labels: { app.kubernetes.io/name: copilot, app.kubernetes.io/part-of: ride-matching }
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["matching-engine", "batcherd"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    resourceNames: ["matching-engine", "batcherd"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: copilot-actions
+  namespace: ride-matching
+  labels: { app.kubernetes.io/name: copilot, app.kubernetes.io/part-of: ride-matching }
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: copilot-actions
+subjects:
+  - kind: ServiceAccount
+    name: copilot
+    namespace: ride-matching

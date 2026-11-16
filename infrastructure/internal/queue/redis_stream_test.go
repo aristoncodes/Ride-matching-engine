@@ -6,8 +6,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+
+	"github.com/aditya/ride-matching/internal/metrics"
 	"github.com/aditya/ride-matching/internal/queue"
-	"github.com/aditya/ride-matching/internal/testutil"
+	rtestutil "github.com/aditya/ride-matching/internal/testutil"
 )
 
 func newQueue(t *testing.T, addr, consumer string) *queue.RedisStream {
@@ -36,7 +40,7 @@ func request(id string) queue.RideRequest {
 }
 
 func TestPublishAndConsume(t *testing.T) {
-	proc := testutil.StartRedis(t)
+	proc := rtestutil.StartRedis(t)
 	q := newQueue(t, proc.Addr, "c1")
 	ctx := context.Background()
 
@@ -94,7 +98,7 @@ func TestPublishAndConsume(t *testing.T) {
 // slower way to lose the request, because the message sits in a dead consumer's
 // pending list, safely stored and delivered to nobody.
 func TestUnackedMessageIsRedelivered(t *testing.T) {
-	proc := testutil.StartRedis(t)
+	proc := rtestutil.StartRedis(t)
 	ctx := context.Background()
 
 	// Consumer A claims the work...
@@ -158,7 +162,7 @@ func TestMinIdleProtectsWorkInProgress(t *testing.T) {
 	// the entire distinction between "crashed" and "still working" — set it too
 	// low and two consumers process the same request concurrently, which for a
 	// ride request means dispatching two cars.
-	proc := testutil.StartRedis(t)
+	proc := rtestutil.StartRedis(t)
 	ctx := context.Background()
 
 	slow := newQueue(t, proc.Addr, "slow-but-alive")
@@ -190,7 +194,7 @@ func TestMinIdleProtectsWorkInProgress(t *testing.T) {
 // TestPoisonMessageIsDeadLettered proves a repeatedly-failing message is set
 // aside rather than blocking the queue forever.
 func TestPoisonMessageIsDeadLettered(t *testing.T) {
-	proc := testutil.StartRedis(t)
+	proc := rtestutil.StartRedis(t)
 	ctx := context.Background()
 
 	q := newQueue(t, proc.Addr, "poison-handler") // MaxDeliveries = 3
@@ -238,13 +242,13 @@ func TestPoisonMessageIsDeadLettered(t *testing.T) {
 func TestMalformedMessageIsDeadLetteredNotRetried(t *testing.T) {
 	// A payload that fails to decode will fail identically on every redelivery.
 	// Retrying it is how a queue stalls on a single bad entry.
-	proc := testutil.StartRedis(t)
+	proc := rtestutil.StartRedis(t)
 	ctx := context.Background()
 
 	q := newQueue(t, proc.Addr, "c1")
 
 	// Write an entry directly, bypassing Publish's validation.
-	if err := testutil.RedisCmd(ctx, proc.Addr,
+	if err := rtestutil.RedisCmd(ctx, proc.Addr,
 		"XADD", "requests:stream:test", "*", "garbage", "yes"); err != nil {
 		t.Fatalf("xadd: %v", err)
 	}
@@ -270,7 +274,7 @@ func TestConsumerGroupSplitsWorkWithoutDuplication(t *testing.T) {
 	// The scaling property: N batcher instances share one stream, and each
 	// message goes to exactly ONE of them. If this were wrong, two batchers
 	// would match the same rider twice.
-	proc := testutil.StartRedis(t)
+	proc := rtestutil.StartRedis(t)
 	ctx := context.Background()
 
 	a := newQueue(t, proc.Addr, "batcher-A")
@@ -308,7 +312,7 @@ func TestConsumerGroupSplitsWorkWithoutDuplication(t *testing.T) {
 func TestPublishRejectsMissingRequestID(t *testing.T) {
 	// At-least-once delivery makes an idempotency key mandatory: without one, a
 	// redelivered message is indistinguishable from a second customer.
-	proc := testutil.StartRedis(t)
+	proc := rtestutil.StartRedis(t)
 	q := newQueue(t, proc.Addr, "c1")
 
 	if _, err := q.Publish(context.Background(), queue.RideRequest{RiderID: "R-1"}); err == nil {
@@ -345,7 +349,7 @@ func TestConsumerGroupStartsAtZeroNotEnd(t *testing.T) {
 	// Requests published BEFORE any consumer existed must still be delivered.
 	// Creating the group at "$" instead of "0" would silently skip them —
 	// a data-loss bug that only shows up on a cold start.
-	proc := testutil.StartRedis(t)
+	proc := rtestutil.StartRedis(t)
 	ctx := context.Background()
 
 	publisher := newQueue(t, proc.Addr, "publisher")
@@ -365,7 +369,7 @@ func TestConsumerGroupStartsAtZeroNotEnd(t *testing.T) {
 }
 
 func TestDepthAndPendingReportQueueHealth(t *testing.T) {
-	proc := testutil.StartRedis(t)
+	proc := rtestutil.StartRedis(t)
 	ctx := context.Background()
 	q := newQueue(t, proc.Addr, "c1")
 
@@ -392,6 +396,48 @@ func TestDepthAndPendingReportQueueHealth(t *testing.T) {
 	if p, _ := q.Pending(ctx); p != 2 {
 		t.Errorf("pending = %d, want 2", p)
 	}
+
+	// The alerts read these gauges, not the return values.
+	if g := value(t, metrics.QueueDepth.WithLabelValues("test")); g != 3 {
+		t.Errorf("queue_depth gauge = %v, want 3", g)
+	}
+	if g := value(t, metrics.QueuePending.WithLabelValues("test")); g != 2 {
+		t.Errorf("queue_pending gauge = %v, want 2", g)
+	}
+}
+
+func TestDeadLetterDepthSetsGauge(t *testing.T) {
+	proc := rtestutil.StartRedis(t)
+	ctx := context.Background()
+	q := newQueue(t, proc.Addr, "c1")
+
+	if err := q.DeadLetter(ctx, queue.Message{Request: request("dead-1")}, "test"); err != nil {
+		t.Fatalf("dead-letter: %v", err)
+	}
+	if n, err := q.DeadLetterDepth(ctx); err != nil || n != 1 {
+		t.Fatalf("dead-letter depth = %d (err %v), want 1", n, err)
+	}
+	if g := value(t, metrics.QueueDeadLettered.WithLabelValues("test")); g != 1 {
+		t.Errorf("queue_dead_lettered gauge = %v, want 1", g)
+	}
+}
+
+func TestRedisErrorsAreCounted(t *testing.T) {
+	proc := rtestutil.StartRedis(t)
+	q := newQueue(t, proc.Addr, "c1")
+
+	// Closing the pool makes every later call fail without needing to kill
+	// the shared test Redis.
+	_ = q.Close()
+
+	c := metrics.DependencyErrorsTotal.WithLabelValues("redis", "true")
+	before := value(t, c)
+	if _, err := q.Publish(context.Background(), request("x")); err == nil {
+		t.Fatal("publish on a closed client should fail")
+	}
+	if after := value(t, c); after != before+1 {
+		t.Errorf("dependency errors = %v, want %v", after, before+1)
+	}
 }
 
 // TestUnmatchedRiderIsNotTreatedAsPoison pins the bug the Week 16 chaos test
@@ -409,7 +455,7 @@ func TestDepthAndPendingReportQueueHealth(t *testing.T) {
 // Republish is the fix: it resets the infrastructure counter and advances a
 // separate, business-level MatchAttempts instead.
 func TestUnmatchedRiderIsNotTreatedAsPoison(t *testing.T) {
-	proc := testutil.StartRedis(t)
+	proc := rtestutil.StartRedis(t)
 	ctx := context.Background()
 	q := newQueue(t, proc.Addr, "matcher") // MaxDeliveries = 3
 
@@ -459,7 +505,7 @@ func TestUnmatchedRiderIsNotTreatedAsPoison(t *testing.T) {
 }
 
 func TestRepublishPreservesThePayload(t *testing.T) {
-	proc := testutil.StartRedis(t)
+	proc := rtestutil.StartRedis(t)
 	ctx := context.Background()
 	q := newQueue(t, proc.Addr, "c1")
 
@@ -494,4 +540,22 @@ func TestRepublishPreservesThePayload(t *testing.T) {
 	if got.RiderID != original.RiderID {
 		t.Errorf("rider id = %q, want %q", got.RiderID, original.RiderID)
 	}
+}
+
+// value reads a collector's current value. Written against client_model rather
+// than prometheus/testutil, which would pull extra modules into go.mod.
+func value(t *testing.T, c prometheus.Collector) float64 {
+	t.Helper()
+	m, ok := c.(prometheus.Metric)
+	if !ok {
+		t.Fatalf("%T is not a single metric", c)
+	}
+	var out dto.Metric
+	if err := m.Write(&out); err != nil {
+		t.Fatalf("read metric: %v", err)
+	}
+	if out.Gauge != nil {
+		return out.Gauge.GetValue()
+	}
+	return out.Counter.GetValue()
 }

@@ -51,20 +51,46 @@ paths:
     get:
       summary: Get the status/result of a ride request
       operationId: getRideRequest
+      description: >
+        Poll this after a 202 to learn the outcome. There is no push channel
+        for riders in v1, so polling is the only delivery mechanism; a
+        3-second matching window (ADR-0005) makes a 1-2s interval sensible.
+
+        An outcome is readable for 24 hours after its last update, then
+        expires. This is a receipt to be polled for, not a trip history.
       parameters:
         - name: id
           in: path
           required: true
-          schema: { type: string, example: "RQ-9f2c..." }
+          description: >
+            The request_id returned by POST /ride-requests. Ids not matching
+            that generator's alphabet ([A-Za-z0-9._-], max 64 chars) are
+            rejected with 400 rather than looked up.
+          schema:
+            type: string
+            maxLength: 64
+            pattern: "^[A-Za-z0-9._-]+$"
+            example: "req_9f2c1b8a4d5e6f70"
       responses:
         "200":
-          description: Current status, including the match if completed.
+          description: Current status, including the match if one was made.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/RideRequestStatus"
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "404": { $ref: "#/components/responses/NotFound" }
+        "404":
+          description: >
+            No such request FOR THIS TENANT. Deliberately indistinguishable
+            from another tenant's request: a 403 would confirm the id is real,
+            which is itself the disclosure. Also returned once an outcome has
+            passed its retention window.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
 
   /healthz:
     get:
@@ -123,21 +149,74 @@ components:
 
     RideRequestStatus:
       type: object
+      required: [request_id, status, match, attempts]
       properties:
-        request_id: { type: string }
+        request_id: { type: string, example: "req_9f2c1b8a4d5e6f70" }
         status:
           type: string
-          enum: [PENDING, BATCHED, MATCHED, UNMATCHED, CANCELLED]
+          description: >
+            Only states the system can actually reach.
+
+            An earlier draft also listed BATCHED and CANCELLED. Neither was
+            ever emitted: BATCHED is a sub-second transient no client can
+            usefully poll for, and cancellation is not built (see
+            Scope_and_Production_Comparison.md). Publishing a status a client
+            can branch on but never receive is a contract that lies, so they
+            are gone rather than left aspirational.
+
+            PENDING is the only non-terminal state; the other three are final.
+          enum: [PENDING, MATCHED, UNMATCHED, FAILED]
+          example: MATCHED
         match:
+          description: >
+            The assignment. Explicitly null unless status is MATCHED — never
+            a half-populated object.
           nullable: true
           allOf: [{ $ref: "#/components/schemas/Match" }]
+        reason:
+          type: string
+          description: >
+            Why a non-MATCHED terminal state was reached. Present on UNMATCHED
+            and FAILED, absent otherwise.
+
+            The two differ in a way that matters to the caller: UNMATCHED means
+            the system looked and there was no car — a real answer. FAILED
+            means the request could not be processed at all, which is our fault
+            and may be worth retrying.
+          example: "no driver found after 20 match attempts"
+        attempts:
+          type: integer
+          description: How many matching windows this request has been through.
+          example: 3
+        updated_at:
+          type: string
+          format: date-time
+          description: Server clock at the last status change, RFC 3339.
 
     Match:
       type: object
+      required: [driver_id, straight_line_meters]
       properties:
         driver_id: { type: string, example: "D-7e4d..." }
-        cost: { type: number, format: double }
-        eta_seconds: { type: integer, example: 240 }
+        straight_line_meters:
+          type: number
+          format: double
+          description: >
+            Straight-line distance between rider and driver at match time.
+            Always present: it is computable under either cost metric, and it
+            is what makes the response auditable — an ETA of 40s across a 6km
+            gap is visibly wrong.
+          example: 812.5
+        eta_seconds:
+          type: integer
+          description: >
+            Driving time for the driver to reach the rider.
+
+            OMITTED under euclidean pricing, where the engine has no basis for
+            an ETA. Absent rather than 0 on purpose — a client would read 0 as
+            "the car is already here". Mirrors `optional int32 eta_seconds` in
+            matching.proto.
+          example: 240
 
     # The ONE shape every non-2xx response takes. A client writes its error
     # handling once, against this. Kept in sync with internal/api/errors.go —
