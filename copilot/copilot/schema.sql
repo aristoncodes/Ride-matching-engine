@@ -1,5 +1,4 @@
 -- Copilot Postgres schema (PLAN.md 2.1). Idempotent: safe to apply on every start.
--- Only the logs table for now; other tables arrive with their tickets.
 
 CREATE TABLE IF NOT EXISTS logs (
   id          bigserial PRIMARY KEY,
@@ -37,4 +36,38 @@ CREATE TABLE IF NOT EXISTS incidents_truth (
   start_time       timestamptz NOT NULL,
   expected_runbook text,                -- anchor, or NULL for no-fault runs
   PRIMARY KEY (run_id, fault)
+);
+
+-- DP-4: one row per incident the copilot has seen.
+CREATE TABLE IF NOT EXISTS incidents_seen (
+  id           uuid PRIMARY KEY,
+  opened_at    timestamptz NOT NULL,
+  source       text NOT NULL,           -- alert | detector | question
+  trigger      jsonb NOT NULL,          -- raw alert or detection event
+  diagnosis    jsonb,                   -- Diagnosis, or NULL if fallback only
+  fallback     jsonb,                   -- raw evidence + top runbook matches
+  status       text NOT NULL,           -- running | diagnosed | needs_human | failed
+  verdict      text,                    -- correct | partly | wrong, set by human
+  verdict_by   text,
+  verdict_at   timestamptz,
+  tokens_in    integer NOT NULL DEFAULT 0,
+  tokens_out   integer NOT NULL DEFAULT 0,
+  cost_usd     numeric(10,6) NOT NULL DEFAULT 0,
+  latency_ms   integer
+);
+
+-- AC-3: every action transition records who and when.
+CREATE TABLE IF NOT EXISTS actions (
+  id           uuid PRIMARY KEY,
+  incident_id  uuid NOT NULL REFERENCES incidents_seen(id),
+  kind         text NOT NULL CHECK (kind IN ('restart_pods','scale')),
+  deployment   text NOT NULL CHECK (deployment IN ('matching-engine','batcherd')),
+  replicas     integer,                 -- scale only; bounded by SCALE_LIMITS
+  reason       text NOT NULL,
+  status       text NOT NULL CHECK (status IN ('proposed','approved','rejected','executed','failed')),
+  proposed_at  timestamptz NOT NULL,
+  decided_by   text,
+  decided_at   timestamptz,
+  executed_at  timestamptz,
+  result       text
 );

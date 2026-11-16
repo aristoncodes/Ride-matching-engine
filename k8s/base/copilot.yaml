@@ -1,0 +1,75 @@
+# The incident copilot: receives Alertmanager webhooks (see prometheus.yaml),
+# diagnoses, and runs approved actions using the ServiceAccount in
+# copilot-rbac.yaml.
+#
+# The Secret `copilot-env` (API tokens, database URLs, model credentials) is
+# deliberately NOT in this repo. Create it before applying this file, e.g.
+#   kubectl -n ride-matching create secret generic copilot-env --from-env-file=<file outside git>
+# Without it the pod stays in CreateContainerConfigError, which is the safe
+# failure: no secret value ever lands in git.
+#
+# The image tag is pinned to `dev` only; kind loads it locally, so there is no
+# registry to pull from and no reason for a floating or latest tag.
+apiVersion: v1
+kind: Service
+metadata:
+  name: copilot
+  namespace: ride-matching
+  labels: { app.kubernetes.io/name: copilot, app.kubernetes.io/part-of: ride-matching }
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: copilot }
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: copilot
+  namespace: ride-matching
+  labels: { app.kubernetes.io/name: copilot, app.kubernetes.io/part-of: ride-matching }
+spec:
+  # One replica: incident and approval state is rate-limited and de-duplicated
+  # per process, and a second copy would just race the first on approvals.
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: copilot }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: copilot, app.kubernetes.io/part-of: ride-matching }
+    spec:
+      serviceAccountName: copilot
+      containers:
+        - name: copilot
+          image: ride-matching/copilot:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: copilot-env
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+          # Read-only root, so anything the app writes goes to /tmp below.
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
