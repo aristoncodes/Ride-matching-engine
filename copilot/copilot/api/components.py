@@ -41,5 +41,9 @@ async def build_agent_components() -> AgentComponents:
         prom_client=httpx.AsyncClient(timeout=10.0),
         prom_base_url=os.environ.get("PROMETHEUS_URL", DEFAULT_PROMETHEUS_URL),
         embedder=LocalEmbedder(),
-        guarded_model=GuardedModel(GroqClient(), cache=RedisCache()),
+        guarded_model=GuardedModel(
+            GroqClient(),
+            cache=RedisCache(),
+            timeout_s=float(os.environ.get("MODEL_CALL_TIMEOUT_S", "20")),
+        ),
     )

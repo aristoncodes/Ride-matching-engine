@@ -24,6 +24,26 @@ TOOL_ERRORS = Counter(
 DIAGNOSES = Counter(
     "copilot_diagnoses_total", "Diagnoses finished", ["status"], registry=REGISTRY
 )
+# Per successful model call (cache hits make no call and are not counted).
+MODEL_CALL_SECONDS = Histogram(
+    "copilot_model_call_seconds",
+    "Wall time of one successful model call",
+    buckets=(0.5, 1, 2, 5, 10, 20, 30, 45, 60, 90),
+    registry=REGISTRY,
+)
+MODEL_TOKENS_PER_SECOND = Histogram(
+    "copilot_model_output_tokens_per_second",
+    "Output tokens per second of one successful model call",
+    buckets=(1, 2, 5, 10, 20, 50, 100, 200),
+    registry=REGISTRY,
+)
+# Per diagnosis: the cost-per-request figure. Free models record 0.
+DIAGNOSIS_COST_USD = Histogram(
+    "copilot_diagnosis_cost_usd",
+    "Model cost of one diagnosis in USD",
+    buckets=(0.0001, 0.001, 0.01, 0.05, 0.1, 0.5, 1.0),
+    registry=REGISTRY,
+)
 for _d in ("in", "out"):
     MODEL_TOKENS.labels(_d)
 for _s in ("diagnosed", "needs_human", "failed"):

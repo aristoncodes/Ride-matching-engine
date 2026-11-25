@@ -182,3 +182,33 @@ def test_local_base_url_parses_tool_calls(monkeypatch: pytest.MonkeyPatch) -> No
     assert [(t.name, t.arguments) for t in res.tool_calls] == [
         ("query_metric", {"name": "queue_depth"})
     ]
+
+
+GEMINI = "https://generativelanguage.googleapis.com/v1beta/openai"
+
+
+def test_hosted_provider_uses_llm_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LLM_BASE_URL", GEMINI)
+    monkeypatch.setenv("LLM_API_KEY", FAKE_KEY)
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, json=CANNED)
+
+    asyncio.run(GroqClient(transport=httpx.MockTransport(handler)).chat([]))
+    assert seen["url"] == GEMINI + "/chat/completions"
+    assert seen["auth"] == f"Bearer {FAKE_KEY}"
+
+
+def test_hosted_provider_without_any_key_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LLM_BASE_URL", GEMINI)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    client = GroqClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json=CANNED)))
+    with pytest.raises(RuntimeError) as ei:
+        asyncio.run(client.chat([]))
+    assert "LLM_API_KEY" in str(ei.value)
+    assert "Bearer" not in str(ei.value)

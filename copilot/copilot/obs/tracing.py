@@ -7,11 +7,30 @@ model output.
 
 from __future__ import annotations
 
+import os
 import time
 
 from opentelemetry import trace
 
 _NAME = "copilot"
+
+
+def configure_tracing() -> None:
+    """Print spans to stdout when OTEL_TRACES_EXPORTER=console. Otherwise leave the no-op default.
+
+    Spans carry only the attributes set in emit_step, so the console output holds no prompt
+    text. Cloud Trace is ticket 3.3 and is not wired here.
+    """
+    if os.environ.get("OTEL_TRACES_EXPORTER", "").strip().lower() != "console":
+        return
+    if not isinstance(trace.get_tracer_provider(), trace.ProxyTracerProvider):
+        return  # a provider is already set (tests, or an earlier call): do not replace it
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+
+    provider = TracerProvider()
+    provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+    trace.set_tracer_provider(provider)
 
 
 def get_tracer() -> trace.Tracer:
