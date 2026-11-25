@@ -236,6 +236,7 @@ async def _run(deps: AppDeps, incident_id: str, req: DiagnoseRequest) -> Diagnos
     metrics.MODEL_TOKENS.labels("in").inc(tokens_in)
     metrics.MODEL_TOKENS.labels("out").inc(tokens_out)
     metrics.MODEL_COST.inc(cost)
+    metrics.DIAGNOSIS_COST_USD.observe(cost)
     metrics.DIAGNOSIS_SECONDS.observe(elapsed)
     metrics.DIAGNOSES.labels(status).inc()
     await deps.pool_app.execute(
@@ -287,6 +288,10 @@ def create_app(
     deps: AppDeps, on_startup: Callable[[AppDeps], Awaitable[None]] | None = None
 ) -> FastAPI:
     from contextlib import asynccontextmanager
+
+    from copilot.obs.tracing import configure_tracing
+
+    configure_tracing()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -577,7 +582,10 @@ def build_default_app() -> FastAPI:
             c.embedder,
             c.guarded_model,
         )
-        d.k8s_api = await asyncio.to_thread(k8s.KubernetesActions)
+        if os.environ.get("COPILOT_K8S_ACTIONS", "on").strip().lower() == "off":
+            d.k8s_api = k8s.DisabledK8sActions()  # no cluster to talk to (for example Cloud Run)
+        else:
+            d.k8s_api = await asyncio.to_thread(k8s.KubernetesActions)
 
     return create_app(deps, startup)
 

@@ -33,7 +33,11 @@ from copilot.agents.model import ChatResult, ModelUsage, ToolCall, record_usage
 
 DEFAULT_MODEL = "qwen/qwen3.8-27b"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-TIMEOUT_S = 30.0
+# Per-HTTP-call timeout. MODEL_CALL_TIMEOUT_S raises it for a slow local model (set it with the
+# GuardedModel timeout in components.py so the two stay in step).
+TIMEOUT_S = float(os.environ.get("MODEL_CALL_TIMEOUT_S", "30"))
+# Hosts treated as a local server: no key is sent and none is required.
+LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "host.docker.internal"})
 
 
 class GroqClient:
@@ -53,10 +57,15 @@ class GroqClient:
     async def chat(self, messages: list[dict], tools: list[dict] | None = None) -> ChatResult:
         base = (os.environ.get("LLM_BASE_URL") or "").strip().rstrip("/") or GROQ_BASE_URL
         headers: dict[str, str] = {}
-        if httpx.URL(base).host == httpx.URL(GROQ_BASE_URL).host:
-            key = os.environ.get("GROQ_API_KEY", "").strip()
+        if httpx.URL(base).host not in LOCAL_HOSTS:
+            # Any hosted OpenAI-compatible provider (Groq, Gemini's OpenAI endpoint) needs a key.
+            # LLM_API_KEY is the provider-neutral name; GROQ_API_KEY still works for Groq.
+            key = (os.environ.get("LLM_API_KEY") or os.environ.get("GROQ_API_KEY") or "").strip()
             if not key:
-                raise RuntimeError("GROQ_API_KEY is not set; the Groq model client is unavailable")
+                raise RuntimeError(
+                    "No model API key is set (LLM_API_KEY or GROQ_API_KEY); "
+                    "the model client is unavailable"
+                )
             headers["Authorization"] = f"Bearer {key}"
         model = self._model or os.environ.get("GROQ_MODEL") or DEFAULT_MODEL
         payload: dict = {"model": model, "messages": messages, "temperature": 0}

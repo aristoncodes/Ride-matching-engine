@@ -104,3 +104,45 @@ def test_spans_per_step_without_prompt_text():
             assert "Investigate" not in str(v) and "alert" not in str(v).lower()
     prompts = " ".join(m.prompts)
     assert prompts  # prompts existed, yet none leaked into spans
+
+
+def test_model_call_records_latency_and_tokens_per_second():
+    from copilot.obs import metrics
+
+    before = metrics.REGISTRY.get_sample_value("copilot_model_output_tokens_per_second_count") or 0
+    before_calls = metrics.REGISTRY.get_sample_value("copilot_model_call_seconds_count") or 0
+
+    async def go():
+        m = _guarded(UsageInner())
+        m.reset_usage()
+        await m.generate("s", "tps-probe-1")
+        await m.generate("s", "tps-probe-1")  # cache hit: no model call, no new sample
+
+    asyncio.run(go())
+    after = metrics.REGISTRY.get_sample_value("copilot_model_output_tokens_per_second_count")
+    after_calls = metrics.REGISTRY.get_sample_value("copilot_model_call_seconds_count")
+    assert after - before == 1
+    assert after_calls - before_calls == 1
+
+
+def test_configure_tracing_is_noop_without_env_and_keeps_existing_provider(monkeypatch):
+    from copilot.obs import tracing
+
+    provider = trace.get_tracer_provider()
+    monkeypatch.delenv("OTEL_TRACES_EXPORTER", raising=False)
+    tracing.configure_tracing()
+    assert trace.get_tracer_provider() is provider
+    # A provider is already set in this process, so console mode also must not replace it.
+    monkeypatch.setenv("OTEL_TRACES_EXPORTER", "console")
+    tracing.configure_tracing()
+    assert trace.get_tracer_provider() is provider
+
+
+def test_diagnosis_cost_histogram_and_price_rows_exist():
+    from copilot import cost
+    from copilot.obs import metrics
+
+    assert cost.cost_usd("copilot-qwen2.5-3b", 1000, 1000) == 0.0
+    assert cost.cost_usd("gemini-2.5-flash", 1000, 1000) == 0.0
+    metrics.DIAGNOSIS_COST_USD.observe(0.0)
+    assert metrics.REGISTRY.get_sample_value("copilot_diagnosis_cost_usd_count") >= 1

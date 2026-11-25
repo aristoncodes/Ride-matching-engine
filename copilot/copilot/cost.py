@@ -11,6 +11,10 @@ PRICES_USD_PER_M: dict[str, tuple[float, float]] = {
     "openai/gpt-oss-120b": (0.0, 0.0),  # Groq free tier; check current limits
     "openai/gpt-oss-20b": (0.0, 0.0),  # Groq free tier; check current limits
     "qwen/qwen3-32b": (0.0, 0.0),  # Groq free tier; check current limits
+    "qwen/qwen3.8-27b": (0.0, 0.0),  # Groq free tier (the code default); check current limits
+    "gemini-2.5-flash": (0.0, 0.0),  # Gemini API free tier via AI Studio; set paid rates if billed
+    "qwen2.5:3b": (0.0, 0.0),  # local Ollama
+    "copilot-qwen2.5-3b": (0.0, 0.0),  # local Ollama, 8k-context build used by the eval
 }
 # Unknown models are flagged, not silently priced: they cost 0.0 here, so check the table.
 FALLBACK_PRICE: tuple[float, float] = (0.0, 0.0)

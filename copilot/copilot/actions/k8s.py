@@ -48,6 +48,19 @@ class K8sApi(Protocol):
     def scale(self, namespace: str, deployment: str, replicas: int) -> str: ...
 
 
+class DisabledK8sActions:
+    """K8sApi for a deployment with no Kubernetes access (for example Cloud Run).
+
+    Proposals and approvals still work; executing an approved action fails with a fixed message.
+    """
+
+    def restart_pods(self, namespace: str, deployment: str) -> str:
+        raise ActionError("kubernetes actions are disabled in this deployment")
+
+    def scale(self, namespace: str, deployment: str, replicas: int) -> str:
+        raise ActionError("kubernetes actions are disabled in this deployment")
+
+
 def validate(kind: str, deployment: str, replicas: int | None) -> None:
     """Raise ActionError unless this exact action is allowed. Pure; no I/O."""
     if kind not in ("restart_pods", "scale"):

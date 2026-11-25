@@ -33,7 +33,9 @@ import score as scoring  # noqa: E402
 FAULTS = tuple(scoring.EXPECTED_COMPONENT)
 INJECTOR = ROOT / "k8s" / "fault-inject.sh"
 RESULTS_DIR = HERE / "results"
-INVESTIGATE_TIMEOUT_S = 60.0
+# Per-investigation cap. 60 s is the PRD latency target; a slow local model sets a higher one
+# via EVAL_INVESTIGATE_TIMEOUT_S, and the report then states that the cap was raised.
+INVESTIGATE_TIMEOUT_S = float(os.environ.get("EVAL_INVESTIGATE_TIMEOUT_S", "60"))
 INJECTOR_WAIT_S = 600
 INJECTOR_TERM_GRACE_S = 30
 TRIGGER = {

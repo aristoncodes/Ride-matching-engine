@@ -15,6 +15,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Protocol, TypeVar
 
+from copilot.obs import metrics
+
 log = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -45,6 +47,16 @@ _acc_var: ContextVar[_Acc | None] = ContextVar("copilot_usage_acc", default=None
 # Per-call sink: GuardedModel sets a fresh list before each inner call; the client appends to
 # it. wait_for runs the call in a child task, which shares the list through the copied context.
 _sink_var: ContextVar[list[ModelUsage] | None] = ContextVar("copilot_usage_sink", default=None)
+
+
+def _observe_call(sink: list[ModelUsage], elapsed_s: float) -> None:
+    """Latency and output tokens/sec for one successful call. Never raises."""
+    metrics.MODEL_CALL_SECONDS.observe(max(elapsed_s, 0.0))
+    if elapsed_s <= 0:
+        return
+    for usage in sink:
+        if usage.tokens_out > 0:
+            metrics.MODEL_TOKENS_PER_SECOND.observe(usage.tokens_out / elapsed_s)
 
 
 def record_usage(usage: ModelUsage) -> None:
@@ -234,6 +246,7 @@ class GuardedModel:
                     break
                 sink: list[ModelUsage] = []
                 _sink_var.set(sink)
+                call_start = self._clock()
                 try:
                     out = await asyncio.wait_for(call(), timeout=min(self._timeout_s, remaining))
                 except Exception as exc:  # includes TimeoutError
@@ -252,6 +265,7 @@ class GuardedModel:
                     continue
                 settled = True
                 self._add_usage(sink)
+                _observe_call(sink, self._clock() - call_start)
                 self._record_success()
                 return out
 
